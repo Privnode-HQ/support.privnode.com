@@ -8,6 +8,7 @@ import {
   NavbarItem,
 } from "@heroui/react";
 import { Form, useLocation } from "react-router";
+import { ThemeSwitcher } from "./ThemeSwitcher";
 
 function TopNavLink({ href, label }: { href: string; label: string }) {
   const location = useLocation();
@@ -55,6 +56,9 @@ export function AppShell({
         </NavbarContent>
 
         <NavbarContent justify="end">
+          <NavbarItem>
+            <ThemeSwitcher />
+          </NavbarItem>
           {user ? (
             <>
               <NavbarItem className="hidden sm:flex text-sm text-default-600">

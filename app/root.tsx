@@ -55,15 +55,13 @@ export const links: Route.LinksFunction = () => [
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className="light">
+    <html lang="zh-CN" suppressHydrationWarning>
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <script
-          // Keep theme selection consistent with system preference.
-          // HeroUI themes are activated via `html.dark` / `html.light`.
           dangerouslySetInnerHTML={{
-            __html: `(()=>{const m=window.matchMedia('(prefers-color-scheme: dark)');const set=()=>{const d=m.matches;document.documentElement.classList.toggle('dark',d);document.documentElement.classList.toggle('light',!d);document.documentElement.style.colorScheme=d?'dark':'light';};set();m.addEventListener?.('change',set);})();`,
+            __html: `(()=>{try{const t=localStorage.getItem('theme')||'system';const m=window.matchMedia('(prefers-color-scheme: dark)');const d=t==='dark'||(t==='system'&&m.matches);document.documentElement.classList.add(d?'dark':'light');document.documentElement.style.colorScheme=d?'dark':'light';}catch(e){}})();`,
           }}
         />
         <Meta />
