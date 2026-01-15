@@ -1,5 +1,4 @@
 import type { PropsWithChildren } from "react";
-import { useEffect } from "react";
 import {
   Button,
   Link,
@@ -41,25 +40,8 @@ export function AppShell({
     location.pathname === "/admin/tickets" ||
     location.pathname.startsWith("/admin/tickets/");
 
-  // 当进入工单页面时，设置 html/body 为固定高度并禁止滚动
-  useEffect(() => {
-    if (denseWorkspace) {
-      document.documentElement.style.height = "100%";
-      document.documentElement.style.overflow = "hidden";
-      document.body.style.height = "100%";
-      document.body.style.overflow = "hidden";
-    }
-
-    return () => {
-      document.documentElement.style.height = "";
-      document.documentElement.style.overflow = "";
-      document.body.style.height = "";
-      document.body.style.overflow = "";
-    };
-  }, [denseWorkspace]);
-
   return (
-    <div className={denseWorkspace ? "h-full flex flex-col" : "min-h-dvh flex flex-col"}>
+    <div className="min-h-dvh flex flex-col">
       <Navbar maxWidth="full" isBordered>
         <NavbarBrand>
           <Link href="/" className="font-semibold text-foreground">
