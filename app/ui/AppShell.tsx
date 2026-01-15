@@ -34,6 +34,11 @@ export function AppShell({
 }: PropsWithChildren<{
   user: { uid: number; username: string; isAdmin: boolean } | null;
 }>) {
+  const location = useLocation();
+  const denseWorkspace =
+    location.pathname === "/admin/tickets" ||
+    location.pathname.startsWith("/admin/tickets/");
+
   return (
     <div className="min-h-dvh flex flex-col">
       <Navbar maxWidth="full" isBordered>
@@ -73,15 +78,23 @@ export function AppShell({
         </NavbarContent>
       </Navbar>
 
-      <main className="flex-1 container mx-auto max-w-5xl px-4 py-6">
+      <main
+        className={
+          denseWorkspace
+            ? "flex-1 min-h-0 w-full px-2 py-2 flex flex-col"
+            : "flex-1 container mx-auto max-w-5xl px-4 py-6"
+        }
+      >
         {children}
       </main>
 
-      <footer className="border-t border-default-200">
-        <div className="container mx-auto max-w-5xl px-4 py-4 text-sm text-default-500">
-          © {new Date().getFullYear()} Privnode
-        </div>
-      </footer>
+      {!denseWorkspace && (
+        <footer className="border-t border-default-200">
+          <div className="container mx-auto max-w-5xl px-4 py-4 text-sm text-default-500">
+            © {new Date().getFullYear()} Privnode
+          </div>
+        </footer>
+      )}
     </div>
   );
 }

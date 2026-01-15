@@ -43,14 +43,38 @@ export type AdminTicketListItem = {
   created_at: string;
 };
 
-export async function listAllTickets(): Promise<AdminTicketListItem[]> {
+export type AdminTicketListFilters = {
+  status?: TicketStatus;
+  assignedToUid?: number;
+  unassigned?: boolean;
+  query?: string;
+};
+
+export async function listAllTickets(
+  filters: AdminTicketListFilters = {}
+): Promise<AdminTicketListItem[]> {
   const supabase = getSupabaseAdminDb();
-  const { data, error } = await supabase
+  let query = supabase
     .from("tickets")
     .select(
       "id,subject,status,creator_uid,category_id,assigned_to_uid,updated_at,created_at"
     )
     .order("updated_at", { ascending: false });
+
+  if (filters.status) {
+    query = query.eq("status", filters.status);
+  }
+  if (filters.unassigned) {
+    query = query.is("assigned_to_uid", null);
+  }
+  if (typeof filters.assignedToUid === "number") {
+    query = query.eq("assigned_to_uid", filters.assignedToUid);
+  }
+  if (filters.query) {
+    query = query.ilike("subject", `%${filters.query}%`);
+  }
+
+  const { data, error } = await query;
   if (error) throw new Error(`读取工单失败：${error.message}`);
   return (data ?? []) as any;
 }

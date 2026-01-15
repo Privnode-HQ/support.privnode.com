@@ -16,6 +16,7 @@ export default [
   route("admin", "routes/admin.tsx"),
   route("admin/users", "routes/admin.users.tsx"),
   route("admin/categories", "routes/admin.categories.tsx"),
-  route("admin/tickets", "routes/admin.tickets.tsx"),
-  route("admin/tickets/:ticketId", "routes/admin.tickets.$ticketId.tsx"),
+  route("admin/tickets", "routes/admin.tickets.tsx", [
+    route(":ticketId", "routes/admin.tickets.$ticketId.tsx"),
+  ]),
 ] satisfies RouteConfig;

@@ -5,7 +5,6 @@ import {
   CardBody,
   CardHeader,
   Chip,
-  Divider,
   Input,
   Modal,
   ModalBody,
@@ -63,6 +62,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 export async function action({ request, params }: Route.ActionArgs) {
   const admin = await requireAdmin(request);
   const ticketId = params.ticketId;
+  const url = new URL(request.url);
+  const returnTo = `${url.pathname}${url.search}`;
   const form = await request.formData();
   const intent = String(form.get("_intent") ?? "");
 
@@ -72,7 +73,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 
   if (intent === "assignToMe") {
     await assignTicket({ ticketId, uid: admin.uid });
-    return redirect(`/admin/tickets/${ticketId}`);
+    return redirect(returnTo);
   }
 
   if (intent === "reply") {
@@ -125,13 +126,13 @@ export async function action({ request, params }: Route.ActionArgs) {
         { status: 400 }
       );
     }
-    return redirect(`/admin/tickets/${ticketId}`);
+    return redirect(returnTo);
   }
 
   if (intent === "close") {
     const reason = String(form.get("reason") ?? "").trim() || "已完成";
     await closeTicketAsAdmin({ ticketId, reason });
-    return redirect(`/admin/tickets/${ticketId}`);
+    return redirect(returnTo);
   }
 
   return data(
@@ -181,10 +182,10 @@ export default function AdminTicketDetail({
 
   // Reply form component
   const ReplyForm = () => (
-    <Card>
-      <CardHeader className="font-medium">回复工单</CardHeader>
-      <CardBody>
-        <Form method="post" className="space-y-3" encType="multipart/form-data">
+    <Card className="shadow-none border border-default-200">
+      <CardHeader className="font-medium text-sm px-3 py-2">回复</CardHeader>
+      <CardBody className="px-3 py-3">
+        <Form method="post" className="space-y-2" encType="multipart/form-data">
           <input type="hidden" name="_intent" value="reply" />
 
           <Select name="actor" label="回复身份" defaultSelectedKeys={["staff"]}>
@@ -196,11 +197,11 @@ export default function AdminTicketDetail({
           <Textarea
             name="bodyMarkdown"
             label="回复内容（Markdown）"
-            minRows={6}
+            minRows={4}
             isRequired
           />
 
-          <div className="space-y-2">
+          <div className="space-y-1">
             <div className="text-sm font-medium">附件（可选）</div>
             <input
               type="file"
@@ -210,7 +211,7 @@ export default function AdminTicketDetail({
             />
             <div className="text-xs text-default-500">单文件不超过 2MB。</div>
           </div>
-          <Button color="primary" type="submit">
+          <Button color="primary" type="submit" className="h-9">
             发送回复
           </Button>
         </Form>
@@ -219,108 +220,131 @@ export default function AdminTicketDetail({
   );
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-2">
-        <div className="flex items-start justify-between gap-4">
-          <div className="space-y-1">
-            <h1 className="text-2xl font-semibold">{ticket.subject}</h1>
-            <div className="text-sm text-default-600">
-              客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`}
-            </div>
-            <div className="text-sm text-default-600">
+    <div className="p-2 space-y-3">
+      <div className="sticky top-0 z-10 -mx-2 px-2 py-2 bg-background/90 backdrop-blur border-b border-default-200">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h1 className="text-base font-semibold truncate">{ticket.subject}</h1>
+            <div className="mt-0.5 text-xs text-default-500 truncate">
+              客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} ·
               类别：{categoryMap.get(ticket.category_id) ?? ticket.category_id}
             </div>
+            <div className="mt-0.5 text-xs text-default-500 truncate">
+              创建：{new Date(ticket.created_at).toLocaleString("zh-CN")} · 更新：
+              {new Date(ticket.updated_at).toLocaleString("zh-CN")}
+              {ticket.assigned_to_uid ? (
+                <>
+                  {" "}· 分配给：
+                  {userMap.get(ticket.assigned_to_uid) ?? `uid:${ticket.assigned_to_uid}`}
+                </>
+              ) : (
+                " · 未分配"
+              )}
+            </div>
+            {ticket.status === "closed" ? (
+              <div className="mt-0.5 text-xs text-default-600 truncate">
+                关闭原因：{ticket.closed_reason ?? "-"}
+              </div>
+            ) : null}
           </div>
-          <div className="flex items-center gap-2">
-            <Chip color={statusColor as any} variant="flat">
+
+          <div className="shrink-0 flex items-center gap-2">
+            <Chip color={statusColor as any} variant="flat" size="sm">
               {ticketStatusLabel(ticket.status as any)}
             </Chip>
+            {ticket.status !== "closed" && ticket.assigned_to_uid !== loaderData.admin.uid ? (
+              <Form method="post">
+                <input type="hidden" name="_intent" value="assignToMe" />
+                <Button
+                  color="primary"
+                  variant="flat"
+                  type="submit"
+                  className="h-8 px-3 text-sm"
+                >
+                  分配给我
+                </Button>
+              </Form>
+            ) : null}
             {ticket.status !== "closed" && (
-              <Button color="danger" variant="flat" onPress={onOpen}>
-                关闭工单
+              <Button
+                color="danger"
+                variant="flat"
+                onPress={onOpen}
+                className="h-8 px-3 text-sm"
+              >
+                关闭
               </Button>
             )}
           </div>
         </div>
-
-        <div className="text-sm text-default-500">
-          创建时间：{new Date(ticket.created_at).toLocaleString("zh-CN")} · 更新时间：
-          {new Date(ticket.updated_at).toLocaleString("zh-CN")}
-        </div>
-
-        {ticket.status === "closed" ? (
-          <div className="text-sm text-default-600">
-            关闭原因：{ticket.closed_reason ?? "-"}
-          </div>
-        ) : null}
       </div>
 
       {actionData?.ok === false ? (
-        <p className="text-danger">{actionData.error}</p>
+        <p className="text-danger text-sm">{actionData.error}</p>
       ) : null}
 
-      <Card>
-        <CardHeader className="font-medium">表单数据</CardHeader>
-        <CardBody>
+      <details className="rounded-medium border border-default-200">
+        <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+          表单数据
+        </summary>
+        <div className="px-3 pb-3">
           <pre className="text-xs bg-default-100 p-3 rounded-medium overflow-auto">
             {JSON.stringify(ticket.form_data ?? {}, null, 2)}
           </pre>
-        </CardBody>
-      </Card>
+        </div>
+      </details>
 
-      {ticket.status !== "closed" && (
-        <>
-          <Form method="post">
-            <input type="hidden" name="_intent" value="assignToMe" />
-            <Button color="primary" variant="flat" type="submit">
-              分配给我
-            </Button>
-          </Form>
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium">对话</h2>
+          <div className="text-xs text-default-500">
+            {reversedMessages.length} 条
+          </div>
+        </div>
 
-          <ReplyForm />
-        </>
-      )}
-
-      <div className="space-y-4">
-        <h2 className="text-lg font-medium">对话记录</h2>
         {reversedMessages.length === 0 ? (
-          <p className="text-default-600">暂无消息。</p>
+          <p className="text-sm text-default-600">暂无消息。</p>
         ) : (
-          reversedMessages.map((m) => (
-            <Card key={m.id}>
-              <CardBody className="space-y-3">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="text-sm font-medium">
-                    {ActorLabel(m.actor, m.author_display_name)}
+          <div className="space-y-2">
+            {reversedMessages.map((m) => (
+              <Card key={m.id} className="shadow-none border border-default-200">
+                <CardBody className="space-y-2 px-3 py-2">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="text-sm font-medium">
+                      {ActorLabel(m.actor, m.author_display_name)}
+                    </div>
+                    <div className="text-xs text-default-500">
+                      {new Date(m.created_at).toLocaleString("zh-CN")}
+                    </div>
                   </div>
-                  <div className="text-xs text-default-500">
-                    {new Date(m.created_at).toLocaleString("zh-CN")}
+                  <div className="prose prose-sm max-w-none dark:prose-invert">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {m.body_markdown}
+                    </ReactMarkdown>
                   </div>
-                </div>
-                <div className="prose prose-sm max-w-none dark:prose-invert">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {m.body_markdown}
-                  </ReactMarkdown>
-                </div>
 
-                {attachmentsByMessage.get(m.id)?.length ? (
-                  <div className="text-sm text-default-600">
-                    附件：
-                    {attachmentsByMessage.get(m.id)!.map((a) => (
-                      <span key={a.id} className="ml-2">
-                        <a className="text-primary underline" href={`/attachments/${a.id}`}>
-                          {a.filename}
-                        </a>
-                        <span className="text-xs text-default-500">
-                          {" "}({Math.ceil(a.size_bytes / 1024)} KB)
+                  {attachmentsByMessage.get(m.id)?.length ? (
+                    <div className="text-sm text-default-600">
+                      附件：
+                      {attachmentsByMessage.get(m.id)!.map((a) => (
+                        <span key={a.id} className="ml-2">
+                          <a
+                            className="text-primary underline"
+                            href={`/attachments/${a.id}`}
+                          >
+                            {a.filename}
+                          </a>
+                          <span className="text-xs text-default-500">
+                            {" "}({Math.ceil(a.size_bytes / 1024)} KB)
+                          </span>
                         </span>
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-              </CardBody>
-            </Card>
-          ))
+                      ))}
+                    </div>
+                  ) : null}
+                </CardBody>
+              </Card>
+            ))}
+          </div>
         )}
       </div>
 
