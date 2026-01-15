@@ -243,8 +243,9 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
           ) : (
             <div>
               {loaderData.tickets.map((t) => {
-                const creator =
+                const creatorName =
                   userMap.get(t.creator_uid) ?? `uid:${t.creator_uid}`;
+                const creator = `${creatorName} (uid:${t.creator_uid})`;
                 const category = categoryMap.get(t.category_id) ?? t.category_id;
                 const assignee = t.assigned_to_uid
                   ? userMap.get(t.assigned_to_uid) ?? `uid:${t.assigned_to_uid}`

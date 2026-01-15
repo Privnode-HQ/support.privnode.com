@@ -226,7 +226,7 @@ export default function AdminTicketDetail({
           <div className="min-w-0">
             <h1 className="text-base font-semibold truncate">{ticket.subject}</h1>
             <div className="mt-0.5 text-xs text-default-500 truncate">
-              客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} ·
+              客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} (uid:{ticket.creator_uid}) ·
               类别：{categoryMap.get(ticket.category_id) ?? ticket.category_id}
             </div>
             <div className="mt-0.5 text-xs text-default-500 truncate">
