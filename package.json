@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@heroui/react": "^2.8.7",
+    "@netlify/vite-plugin-react-router": "^2.1.2",
     "@react-router/node": "7.12.0",
     "@react-router/serve": "7.12.0",
     "@supabase/supabase-js": "^2.90.1",
