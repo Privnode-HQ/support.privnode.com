@@ -145,8 +145,8 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
   const qValue = String(loaderData.filters.q ?? "");
 
   return (
-    <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-2">
-      <section className="min-h-0 flex flex-col rounded-medium border border-default-200">
+    <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-2 overflow-hidden">
+      <section className="min-h-0 flex flex-col rounded-medium border border-default-200 overflow-hidden">
         <div className="p-2 border-b border-default-200">
           <div className="flex items-center justify-between gap-2">
             <div className="text-sm font-semibold">
