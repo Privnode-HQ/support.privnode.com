@@ -39,6 +39,7 @@ import {
 export async function loader({ request, params }: Route.LoaderArgs) {
   const admin = await requireAdmin(request);
   const ticketId = params.ticketId;
+  const { processTicketLinks } = await import("../server/markdown.server");
 
   const [ticket, messages, attachments, categories, users] = await Promise.all([
     getTicketById(ticketId),
@@ -49,10 +50,18 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   ]);
   if (!ticket) throw new Response("Not Found", { status: 404 });
 
+  // Process ticket links in message markdown (admin can access all tickets)
+  const processedMessages = await Promise.all(
+    messages.map(async (msg) => ({
+      ...msg,
+      body_markdown: await processTicketLinks(msg.body_markdown, admin.uid, true),
+    }))
+  );
+
   return data({
     admin: { uid: admin.uid },
     ticket,
-    messages,
+    messages: processedMessages,
     attachments,
     categories,
     users,
@@ -224,7 +233,12 @@ export default function AdminTicketDetail({
       <div className="sticky top-0 z-10 -mx-2 px-2 py-2 bg-background/90 backdrop-blur border-b border-default-200">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h1 className="text-base font-semibold truncate">{ticket.subject}</h1>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-xs text-default-500">
+                #{ticket.short_id}
+              </span>
+              <h1 className="text-base font-semibold truncate">{ticket.subject}</h1>
+            </div>
             <div className="mt-0.5 text-xs text-default-500 truncate">
               客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} (uid:{ticket.creator_uid}) ·
               类别：{categoryMap.get(ticket.category_id) ?? ticket.category_id}

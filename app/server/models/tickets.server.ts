@@ -3,6 +3,7 @@ import type { TicketStatus } from "../../shared/tickets";
 
 export type TicketListItem = {
   id: string;
+  short_id: string;
   subject: string;
   status: TicketStatus;
   category_id: string;
@@ -13,6 +14,7 @@ export type TicketListItem = {
 
 export type TicketDetails = {
   id: string;
+  short_id: string;
   subject: string;
   status: TicketStatus;
   category_id: string;
@@ -39,7 +41,7 @@ export async function listTicketsForUser(uid: number): Promise<TicketListItem[]>
 
   const { data: tickets, error } = await supabase
     .from("tickets")
-    .select("id,subject,status,category_id,created_at,updated_at")
+    .select("id,short_id,subject,status,category_id,created_at,updated_at")
     .eq("creator_uid", uid)
     .order("updated_at", { ascending: false });
 
@@ -114,7 +116,7 @@ export async function getTicketForUser(params: {
   const { data: t, error } = await supabase
     .from("tickets")
     .select(
-      "id,subject,status,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
     )
     .eq("id", params.ticketId)
     .eq("creator_uid", params.uid)
@@ -224,4 +226,33 @@ export function ticketStatusLabel(s: TicketStatus): string {
     default:
       return s;
   }
+}
+
+export async function getTicketIdByShortId(
+  shortId: string
+): Promise<string | null> {
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("tickets")
+    .select("id,creator_uid")
+    .eq("short_id", shortId)
+    .maybeSingle();
+  if (error) throw new Error(`通过 short_id 查找工单失败：${error.message}`);
+  if (!data) return null;
+  return (data as any).id;
+}
+
+export async function canUserAccessTicket(
+  uid: number,
+  ticketId: string
+): Promise<boolean> {
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("tickets")
+    .select("id")
+    .eq("id", ticketId)
+    .eq("creator_uid", uid)
+    .maybeSingle();
+  if (error) return false;
+  return !!data;
 }

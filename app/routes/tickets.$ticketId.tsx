@@ -28,6 +28,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const { listAttachmentsForTicket } = await import(
     "../server/models/attachments.server"
   );
+  const { processTicketLinks } = await import("../server/markdown.server");
 
   const user = await requireUser(request);
   const ticketId = params.ticketId;
@@ -40,7 +41,16 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     listMessages(ticketId),
     listAttachmentsForTicket(ticketId),
   ]);
-  return data({ ticket, messages, attachments });
+
+  // Process ticket links in message markdown
+  const processedMessages = await Promise.all(
+    messages.map(async (msg) => ({
+      ...msg,
+      body_markdown: await processTicketLinks(msg.body_markdown, user.uid, false),
+    }))
+  );
+
+  return data({ ticket, messages: processedMessages, attachments });
 }
 
 export async function action({ request, params }: Route.ActionArgs) {
@@ -183,7 +193,12 @@ export default function TicketDetail({ loaderData, actionData }: Route.Component
       <div className="space-y-2">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold">{ticket.subject}</h1>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-sm text-default-500">
+                #{ticket.short_id}
+              </span>
+              <h1 className="text-2xl font-semibold">{ticket.subject}</h1>
+            </div>
             <div className="text-sm text-default-600">
               类别：{ticket.category_name ?? ticket.category_id}
             </div>

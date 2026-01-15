@@ -34,6 +34,7 @@ export async function updateMyDisplayName(params: {
 
 export type AdminTicketListItem = {
   id: string;
+  short_id: string;
   subject: string;
   status: TicketStatus;
   creator_uid: number;
@@ -57,7 +58,7 @@ export async function listAllTickets(
   let query = supabase
     .from("tickets")
     .select(
-      "id,subject,status,creator_uid,category_id,assigned_to_uid,updated_at,created_at"
+      "id,short_id,subject,status,creator_uid,category_id,assigned_to_uid,updated_at,created_at"
     )
     .order("updated_at", { ascending: false });
 
@@ -84,7 +85,7 @@ export async function getTicketById(ticketId: string) {
   const { data, error } = await supabase
     .from("tickets")
     .select(
-      "id,subject,status,creator_uid,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,creator_uid,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
     )
     .eq("id", ticketId)
     .maybeSingle();

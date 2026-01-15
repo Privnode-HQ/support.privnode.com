@@ -58,6 +58,7 @@ export default function Tickets({ loaderData }: Route.ComponentProps) {
         <CardBody>
           <Table aria-label="tickets">
             <TableHeader>
+              <TableColumn>工单ID</TableColumn>
               <TableColumn>标题</TableColumn>
               <TableColumn>类别</TableColumn>
               <TableColumn>状态</TableColumn>
@@ -66,6 +67,11 @@ export default function Tickets({ loaderData }: Route.ComponentProps) {
             <TableBody emptyContent="暂无工单。">
               {tickets.map((t) => (
                 <TableRow key={t.id}>
+                  <TableCell>
+                    <span className="font-mono text-sm text-default-600">
+                      #{t.short_id}
+                    </span>
+                  </TableCell>
                   <TableCell>
                     <UiLink as={Link} to={`/tickets/${t.id}`} color="primary">
                       {t.subject}

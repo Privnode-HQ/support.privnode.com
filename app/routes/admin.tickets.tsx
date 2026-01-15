@@ -265,8 +265,13 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">
-                          {t.subject}
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono text-xs text-default-500">
+                            #{t.short_id}
+                          </span>
+                          <div className="text-sm font-medium truncate">
+                            {t.subject}
+                          </div>
                         </div>
                         <div className="mt-0.5 text-xs text-default-500 truncate">
                           {creator} · {category} · {formatCompactDateTime(t.updated_at)}
