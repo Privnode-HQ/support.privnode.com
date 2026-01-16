@@ -95,12 +95,23 @@ export async function getTicketById(ticketId: string) {
 
 export async function assignTicket(params: { ticketId: string; uid: number }) {
   const supabase = getSupabaseAdminDb();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("tickets")
     .update({ assigned_to_uid: params.uid, status: "assigned" })
     .eq("id", params.ticketId)
-    .neq("status", "closed");
+    .neq("status", "closed")
+    .select("id")
+    .maybeSingle();
   if (error) throw new Error(`分配工单失败：${error.message}`);
+
+  if (!updated) return;
+
+  const { error: msgErr } = await supabase.from("ticket_messages").insert({
+    ticket_id: params.ticketId,
+    actor: "system",
+    body_markdown: "工单已分配给工作人员。",
+  });
+  if (msgErr) throw new Error(`创建系统消息失败：${msgErr.message}`);
 }
 
 export async function addAdminReply(params: {
@@ -151,16 +162,29 @@ export async function closeTicketAsAdmin(params: {
   reason: string;
 }) {
   const supabase = getSupabaseAdminDb();
-  const { error } = await supabase
+
+  const reason = params.reason.trim() || "已完成";
+  const { data: updated, error } = await supabase
     .from("tickets")
     .update({
       status: "closed",
-      closed_reason: params.reason,
+      closed_reason: reason,
       closed_at: new Date().toISOString(),
     })
     .eq("id", params.ticketId)
-    .neq("status", "closed");
+    .neq("status", "closed")
+    .select("id")
+    .maybeSingle();
   if (error) throw new Error(`关闭工单失败：${error.message}`);
+
+  if (!updated) return;
+
+  const { error: msgErr } = await supabase.from("ticket_messages").insert({
+    ticket_id: params.ticketId,
+    actor: "system",
+    body_markdown: `工作人员关闭了工单（原因：${reason}）。`,
+  });
+  if (msgErr) throw new Error(`创建系统消息失败：${msgErr.message}`);
 }
 
 export type AdminCategoryRow = {

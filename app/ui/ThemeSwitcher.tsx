@@ -5,6 +5,7 @@ import {
   DropdownMenu,
   DropdownItem,
 } from "@heroui/react";
+import type { ReactElement } from "react";
 import { useTheme, type Theme } from "./ThemeProvider";
 
 const SunIcon = () => (
@@ -58,7 +59,7 @@ const ComputerIcon = () => (
   </svg>
 );
 
-const themeIcons: Record<Theme, () => JSX.Element> = {
+const themeIcons: Record<Theme, () => ReactElement> = {
   light: SunIcon,
   dark: MoonIcon,
   system: ComputerIcon,

@@ -198,17 +198,30 @@ export async function closeTicket(params: {
   reason: string;
 }) {
   const supabase = getSupabaseAdminDb();
-  const { error } = await supabase
+
+  const reason = params.reason.trim() || "已完成";
+  const { data: updated, error } = await supabase
     .from("tickets")
     .update({
       status: "closed",
-      closed_reason: params.reason,
+      closed_reason: reason,
       closed_at: new Date().toISOString(),
     })
     .eq("id", params.ticketId)
     .eq("creator_uid", params.uid)
-    .neq("status", "closed");
+    .neq("status", "closed")
+    .select("id")
+    .maybeSingle();
   if (error) throw new Error(`关闭工单失败：${error.message}`);
+
+  if (!updated) return;
+
+  const { error: msgErr } = await supabase.from("ticket_messages").insert({
+    ticket_id: params.ticketId,
+    actor: "system",
+    body_markdown: `客户关闭了工单（原因：${reason}）。`,
+  });
+  if (msgErr) throw new Error(`创建系统消息失败：${msgErr.message}`);
 }
 
 export function ticketStatusLabel(s: TicketStatus): string {
