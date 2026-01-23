@@ -1,5 +1,17 @@
 import { getSupabaseAdminDb } from "../supabase.server";
 import type { TicketStatus } from "../../shared/tickets";
+import { ensureSmartSortCronStarted, getTicketSmartScores } from "./smart-sort.server";
+
+function chunkArray<T>(list: T[], chunkSize: number): T[][] {
+  const size = Math.max(1, Math.floor(chunkSize));
+  const chunks: T[][] = [];
+  for (let i = 0; i < list.length; i += size) {
+    chunks.push(list.slice(i, i + size));
+  }
+  return chunks;
+}
+
+const POSTGREST_IN_CHUNK_SIZE = 80;
 
 export type AdminUserRow = {
   uid: number;
@@ -63,6 +75,7 @@ export type AdminTicketListFilters = {
 export async function listAllTickets(
   filters: AdminTicketListFilters = {}
 ): Promise<AdminTicketListItem[]> {
+  ensureSmartSortCronStarted();
   const supabase = getSupabaseAdminDb();
 
   const sort: AdminTicketSort =
@@ -131,66 +144,63 @@ export async function listAllTickets(
 
   const ticketIds = list.map((t) => t.id);
 
-  const [nudgesRes, messagesRes] = await Promise.all([
-    supabase
+  const nudgeRows: any[] = [];
+  for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const res = await supabase
       .from("ticket_nudges")
       .select("ticket_id,created_at")
-      .in("ticket_id", ticketIds)
-      .order("created_at", { ascending: false }),
-    supabase
-      .from("ticket_messages")
-      .select("ticket_id,actor,created_at")
-      .in("ticket_id", ticketIds)
-      .in("actor", ["customer", "staff", "anonymous"]),
-  ]);
-  if (nudgesRes.error)
-    throw new Error(`读取催单记录失败：${nudgesRes.error.message}`);
-  if (messagesRes.error)
-    throw new Error(`读取消息统计失败：${messagesRes.error.message}`);
+      .in("ticket_id", ids);
+    if (res.error) {
+      throw new Error(`读取催单记录失败：${res.error.message}`);
+    }
+    nudgeRows.push(...(res.data ?? []));
+  }
 
   const lastNudgeAtMsByTicket = new Map<string, number>();
   const nudgeCountByTicket = new Map<string, number>();
   const lastNudgeAtRawByTicket = new Map<string, string>();
-  for (const row of nudgesRes.data ?? []) {
+  for (const row of nudgeRows) {
     const ticketId = (row as any).ticket_id as string;
     const createdAt = (row as any).created_at as string;
     if (!ticketId || !createdAt) continue;
 
     nudgeCountByTicket.set(ticketId, (nudgeCountByTicket.get(ticketId) ?? 0) + 1);
 
-    if (!lastNudgeAtMsByTicket.has(ticketId)) {
-      const ts = new Date(createdAt).getTime();
-      if (Number.isFinite(ts)) {
-        lastNudgeAtMsByTicket.set(ticketId, ts);
-        lastNudgeAtRawByTicket.set(ticketId, createdAt);
-      }
+    const ts = new Date(createdAt).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const prev = lastNudgeAtMsByTicket.get(ticketId);
+    if (!prev || ts > prev) {
+      lastNudgeAtMsByTicket.set(ticketId, ts);
+      lastNudgeAtRawByTicket.set(ticketId, createdAt);
     }
   }
 
-  const customerMessageCountByTicket = new Map<string, number>();
-  const hasStaffReplyByTicket = new Map<string, boolean>();
+  const messageTicketIds = Array.from(
+    new Set(nudgeRows.map((r) => (r as any).ticket_id).filter(Boolean))
+  );
+  const messageRows: any[] = [];
+  for (const ids of chunkArray(messageTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const res = await supabase
+      .from("ticket_messages")
+      .select("ticket_id,actor,created_at")
+      .in("ticket_id", ids)
+      .in("actor", ["staff", "anonymous"]);
+    if (res.error) {
+      throw new Error(`读取消息统计失败：${res.error.message}`);
+    }
+    messageRows.push(...(res.data ?? []));
+  }
+
   const lastStaffReplyAtMsByTicket = new Map<string, number>();
-  for (const row of messagesRes.data ?? []) {
+  for (const row of messageRows) {
     const ticketId = (row as any).ticket_id as string;
-    const actor = (row as any).actor as string;
     const createdAt = (row as any).created_at as string;
-    if (!ticketId || !actor || !createdAt) continue;
+    if (!ticketId || !createdAt) continue;
 
-    if (actor === "customer") {
-      customerMessageCountByTicket.set(
-        ticketId,
-        (customerMessageCountByTicket.get(ticketId) ?? 0) + 1
-      );
-      continue;
-    }
-
-    if (actor === "staff" || actor === "anonymous") {
-      hasStaffReplyByTicket.set(ticketId, true);
-      const ts = new Date(createdAt).getTime();
-      if (!Number.isFinite(ts)) continue;
-      const prev = lastStaffReplyAtMsByTicket.get(ticketId);
-      if (!prev || ts > prev) lastStaffReplyAtMsByTicket.set(ticketId, ts);
-    }
+    const ts = new Date(createdAt).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const prev = lastStaffReplyAtMsByTicket.get(ticketId);
+    if (!prev || ts > prev) lastStaffReplyAtMsByTicket.set(ticketId, ts);
   }
 
   const withNudgeInfo = list.map((t) => {
@@ -210,59 +220,24 @@ export async function listAllTickets(
 
   if (sort !== "smart") return withNudgeInfo;
 
-  const creatorUids = Array.from(new Set(withNudgeInfo.map((t) => t.creator_uid)));
-  const { data: openTickets, error: openErr } = await supabase
-    .from("tickets")
-    .select("creator_uid")
-    .in("creator_uid", creatorUids)
-    .neq("status", "closed");
-  if (openErr) throw new Error(`读取用户未关闭工单数失败：${openErr.message}`);
-
-  const openTicketCountByCreator = new Map<number, number>();
-  for (const row of openTickets ?? []) {
-    const uid = Number((row as any).creator_uid);
-    if (!Number.isFinite(uid)) continue;
-    openTicketCountByCreator.set(uid, (openTicketCountByCreator.get(uid) ?? 0) + 1);
-  }
-
-  const nowMs = Date.now();
-  const dayMs = 24 * 60 * 60 * 1000;
-
+  const scoreMap = await getTicketSmartScores(ticketIds);
   const scored = withNudgeInfo.map((t) => {
-    const customerMsgCount = customerMessageCountByTicket.get(t.id) ?? 0;
-    const userReplyCount = Math.max(0, customerMsgCount - 1);
-    const neverHandled = hasStaffReplyByTicket.get(t.id) ? 0 : 1;
-
-    const totalNudges = nudgeCountByTicket.get(t.id) ?? 0;
-    const everNudged = totalNudges > 0 ? 1 : 0;
-    const lastNudgeAtMs = lastNudgeAtMsByTicket.get(t.id) ?? null;
-    const nudgeFreshness = lastNudgeAtMs
-      ? Math.max(0, 1 - (nowMs - lastNudgeAtMs) / dayMs)
-      : 0;
-
-    const rawUrgencyScore =
-      1 * Math.log(1 + userReplyCount) +
-      3 * neverHandled +
-      2 * everNudged +
-      4 * nudgeFreshness +
-      1.5 * Math.log(1 + totalNudges);
-
-    const openCount = Math.max(1, openTicketCountByCreator.get(t.creator_uid) ?? 1);
-    const userPenaltyFactor = 1 / (1 + 0.6 * (openCount - 1));
-    const urgencyScore = rawUrgencyScore * userPenaltyFactor;
-
+    const score = scoreMap.get(t.id);
+    const urgencyScore = score?.urgency_score ?? 0;
     const updatedMs = new Date(t.updated_at).getTime();
     const createdMs = new Date(t.created_at).getTime();
-    const timeScore =
+    const fallbackTimeScore =
       (Number.isFinite(updatedMs) ? updatedMs : 0) * 0.7 +
       (Number.isFinite(createdMs) ? createdMs : 0) * 0.3;
-
+    const timeScore = score?.time_score ?? fallbackTimeScore;
     return { t, urgencyScore, timeScore };
   });
 
   scored.sort((a, b) => {
     if (a.urgencyScore !== b.urgencyScore) {
-      return ascending ? a.urgencyScore - b.urgencyScore : b.urgencyScore - a.urgencyScore;
+      return ascending
+        ? a.urgencyScore - b.urgencyScore
+        : b.urgencyScore - a.urgencyScore;
     }
     if (a.timeScore !== b.timeScore) {
       return ascending ? a.timeScore - b.timeScore : b.timeScore - a.timeScore;

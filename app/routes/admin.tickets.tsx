@@ -1,20 +1,19 @@
 import type { Route } from "./+types/admin.tickets";
-import {
-  Chip,
-  Button,
-} from "@heroui/react";
+import { Chip, Button } from "@heroui/react";
 import { useEffect, useRef } from "react";
 import {
   Form,
   NavLink,
   Outlet,
   data,
+  redirect,
   useLocation,
   useParams,
   useRevalidator,
   useSubmit,
 } from "react-router";
 import { requireAdmin } from "../server/admin";
+import { recomputeTicketSmartScores } from "../server/models/smart-sort.server";
 import {
   type AdminTicketSort,
   type AdminTicketSortDirection,
@@ -22,10 +21,7 @@ import {
   listAllTickets,
   listAllUsers,
 } from "../server/models/admin.server";
-import {
-  type TicketStatus,
-  ticketStatusLabel,
-} from "../shared/tickets";
+import { type TicketStatus, ticketStatusLabel } from "../shared/tickets";
 
 const ALL_TICKET_STATUSES: TicketStatus[] = [
   "pending_assign",
@@ -50,7 +46,10 @@ function parseTicketStatuses(values: string[]): TicketStatus[] {
   return Array.from(set);
 }
 
-function parseAssignedFilters(values: string[], myUid: number): {
+function parseAssignedFilters(
+  values: string[],
+  myUid: number,
+): {
   selected: string[];
   unassigned: boolean;
   assignedToUids: number[];
@@ -113,7 +112,9 @@ export async function loader({ request }: Route.LoaderArgs) {
   const statuses = parseTicketStatuses(statusParams);
   const assigned = parseAssignedFilters(assignedParams, admin.uid);
   const sort: AdminTicketSort =
-    sortParam === "created_at" || sortParam === "updated_at" || sortParam === "smart"
+    sortParam === "created_at" ||
+    sortParam === "updated_at" ||
+    sortParam === "smart"
       ? sortParam
       : "updated_at";
   const dir: AdminTicketSortDirection =
@@ -124,7 +125,9 @@ export async function loader({ request }: Route.LoaderArgs) {
       statuses: statuses.length > 0 ? statuses : undefined,
       unassigned: assigned.unassigned,
       assignedToUids:
-        assigned.assignedToUids.length > 0 ? assigned.assignedToUids : undefined,
+        assigned.assignedToUids.length > 0
+          ? assigned.assignedToUids
+          : undefined,
       query: q || undefined,
       sort,
       sortDirection: dir,
@@ -146,6 +149,34 @@ export async function loader({ request }: Route.LoaderArgs) {
       dir,
     },
   });
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  await requireAdmin(request);
+  const url = new URL(request.url);
+  const returnTo = `${url.pathname}${url.search}`;
+  const form = await request.formData();
+  const intent = String(form.get("_intent") ?? "");
+
+  if (intent === "recomputeSmartScores") {
+    try {
+      await recomputeTicketSmartScores();
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        {
+          ok: false as const,
+          error: e instanceof Error ? e.message : "计算失败。",
+        },
+        { status: 500 }
+      );
+    }
+  }
+
+  return data(
+    { ok: false as const, error: "未知操作。" },
+    { status: 400 }
+  );
 }
 
 function StatusChip({ status }: { status: string }) {
@@ -191,10 +222,13 @@ function FilterChipCheckbox(props: {
   );
 }
 
-export default function AdminTickets({ loaderData }: Route.ComponentProps) {
+export default function AdminTickets({
+  loaderData,
+  actionData,
+}: Route.ComponentProps) {
   const categoryMap = new Map(loaderData.categories.map((c) => [c.id, c.name]));
   const userMap = new Map(
-    loaderData.users.map((u) => [u.uid, u.display_name ?? u.username])
+    loaderData.users.map((u) => [u.uid, u.display_name ?? u.username]),
   );
   const adminUsers = loaderData.users.filter((u) => u.is_admin);
 
@@ -245,15 +279,31 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                 {loaderData.tickets.length}
               </span>
             </div>
-            <Button
-              variant="flat"
-              className="h-8 px-3 text-sm"
-              isLoading={revalidator.state === "loading"}
-              onPress={() => revalidator.revalidate()}
-            >
-              刷新
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="flat"
+                className="h-8 px-3 text-sm"
+                isLoading={revalidator.state === "loading"}
+                onPress={() => revalidator.revalidate()}
+              >
+                刷新
+              </Button>
+              <Form method="post">
+                <input type="hidden" name="_intent" value="recomputeSmartScores" />
+                <Button
+                  type="submit"
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                >
+                  立刻计算
+                </Button>
+              </Form>
+            </div>
           </div>
+
+          {actionData?.ok === false ? (
+            <div className="mt-2 text-xs text-danger">{actionData.error}</div>
+          ) : null}
 
           <Form
             key={location.search}
@@ -275,7 +325,9 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                   />
                 ))}
               </div>
-              <div className="mt-1 text-[11px] text-default-500">不选择 = 全部</div>
+              <div className="mt-1 text-[11px] text-default-500">
+                不选择 = 全部
+              </div>
             </label>
 
             <label className="text-xs text-default-600">
@@ -309,7 +361,9 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                   );
                 })}
               </div>
-              <div className="mt-1 text-[11px] text-default-500">不选择 = 全部</div>
+              <div className="mt-1 text-[11px] text-default-500">
+                不选择 = 全部
+              </div>
             </label>
 
             <div className="col-span-2 flex gap-2">
@@ -322,7 +376,8 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                   className="block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
                 />
               </label>
-
+            </div>
+            <div className="col-span-2 flex gap-2">
               <label className="w-[8.5rem]">
                 <span className="sr-only">排序方式</span>
                 <select
@@ -349,11 +404,7 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                 </select>
               </label>
 
-              <Button
-                type="submit"
-                variant="flat"
-                className="h-8 px-3 text-sm"
-              >
+              <Button type="submit" variant="flat" className="h-8 px-3 text-sm">
                 筛选
               </Button>
               <Button
@@ -377,9 +428,11 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                 const creatorName =
                   userMap.get(t.creator_uid) ?? `uid:${t.creator_uid}`;
                 const creator = `${creatorName} (uid:${t.creator_uid})`;
-                const category = categoryMap.get(t.category_id) ?? t.category_id;
+                const category =
+                  categoryMap.get(t.category_id) ?? t.category_id;
                 const assignee = t.assigned_to_uid
-                  ? userMap.get(t.assigned_to_uid) ?? `uid:${t.assigned_to_uid}`
+                  ? (userMap.get(t.assigned_to_uid) ??
+                    `uid:${t.assigned_to_uid}`)
                   : "未分配";
 
                 return (
@@ -392,7 +445,9 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                         isActive ? "bg-default-100" : "",
                       ].join(" ")
                     }
-                    aria-current={selectedTicketId === t.id ? "page" : undefined}
+                    aria-current={
+                      selectedTicketId === t.id ? "page" : undefined
+                    }
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
@@ -417,7 +472,8 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                           </div>
                         </div>
                         <div className="mt-0.5 text-xs text-default-500 truncate">
-                          {creator} · {category} · {formatCompactDateTime(t.updated_at)}
+                          {creator} · {category} ·{" "}
+                          {formatCompactDateTime(t.updated_at)}
                         </div>
                       </div>
                       <div className="shrink-0 flex flex-col items-end gap-1">

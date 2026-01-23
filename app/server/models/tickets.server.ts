@@ -1,8 +1,10 @@
 import { getSupabaseAdminDb } from "../supabase.server";
 import type { TicketStatus } from "../../shared/tickets";
-import { listAllTickets } from "./admin.server";
+import { ensureSmartSortCronStarted, getTicketSmartScores } from "./smart-sort.server";
 
 export const TICKET_NUDGE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+ensureSmartSortCronStarted();
 
 const OPEN_TICKET_STATUSES: TicketStatus[] = [
   "pending_assign",
@@ -134,14 +136,41 @@ export async function getSmartQueuePositionForTicket(ticketId: string): Promise<
   position: number;
   total: number;
 } | null> {
-  const tickets = await listAllTickets({
-    statuses: OPEN_TICKET_STATUSES,
-    sort: "smart",
-    sortDirection: "desc",
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("tickets")
+    .select("id,created_at,updated_at")
+    .in("status", OPEN_TICKET_STATUSES);
+  if (error) throw new Error(`读取智能队列失败：${error.message}`);
+
+  const list = (data ?? []) as any[];
+  if (list.length === 0) return null;
+
+  const ids = list.map((t) => String(t.id)).filter(Boolean);
+  const scoreMap = await getTicketSmartScores(ids);
+
+  const scored = list.map((t) => {
+    const id = String(t.id);
+    const score = scoreMap.get(id);
+    const urgencyScore = score?.urgency_score ?? 0;
+    const updatedMs = new Date(String(t.updated_at)).getTime();
+    const createdMs = new Date(String(t.created_at)).getTime();
+    const fallbackTimeScore =
+      (Number.isFinite(updatedMs) ? updatedMs : 0) * 0.7 +
+      (Number.isFinite(createdMs) ? createdMs : 0) * 0.3;
+    const timeScore = score?.time_score ?? fallbackTimeScore;
+    return { id, urgencyScore, timeScore };
   });
-  const index = tickets.findIndex((t) => t.id === ticketId);
+
+  scored.sort((a, b) => {
+    if (a.urgencyScore !== b.urgencyScore) return b.urgencyScore - a.urgencyScore;
+    if (a.timeScore !== b.timeScore) return b.timeScore - a.timeScore;
+    return a.id.localeCompare(b.id);
+  });
+
+  const index = scored.findIndex((t) => t.id === ticketId);
   if (index < 0) return null;
-  return { position: index + 1, total: tickets.length };
+  return { position: index + 1, total: scored.length };
 }
 
 export async function listTicketsForUser(uid: number): Promise<TicketListItem[]> {
