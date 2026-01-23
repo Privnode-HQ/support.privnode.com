@@ -434,6 +434,11 @@ export default function AdminTickets({
                   ? (userMap.get(t.assigned_to_uid) ??
                     `uid:${t.assigned_to_uid}`)
                   : "未分配";
+                const showSmartScore = t.status !== "closed";
+                const smartScoreText =
+                  typeof t.smart_urgency_score === "number"
+                    ? t.smart_urgency_score.toFixed(2)
+                    : "未计算";
 
                 return (
                   <NavLink
@@ -481,6 +486,18 @@ export default function AdminTickets({
                         <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
                           {assignee}
                         </div>
+                        {showSmartScore ? (
+                          <div
+                            className="text-[11px] text-default-500"
+                            title={
+                              t.smart_computed_at
+                                ? `智能分数计算时间：${formatCompactDateTime(t.smart_computed_at)}`
+                                : "智能分数尚未计算"
+                            }
+                          >
+                            分: {smartScoreText}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   </NavLink>

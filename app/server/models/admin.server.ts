@@ -54,6 +54,9 @@ export type AdminTicketListItem = {
   assigned_to_uid: number | null;
   nudge_last_at: string | null;
   nudge_pending: boolean;
+  smart_urgency_score: number | null;
+  smart_time_score: number | null;
+  smart_computed_at: string | null;
   updated_at: string;
   created_at: string;
 };
@@ -203,6 +206,8 @@ export async function listAllTickets(
     if (!prev || ts > prev) lastStaffReplyAtMsByTicket.set(ticketId, ts);
   }
 
+  const scoreMap = await getTicketSmartScores(ticketIds);
+
   const withNudgeInfo = list.map((t) => {
     const lastNudgeAtMs = lastNudgeAtMsByTicket.get(t.id) ?? null;
     const lastStaffReplyAtMs = lastStaffReplyAtMsByTicket.get(t.id) ?? null;
@@ -211,25 +216,34 @@ export async function listAllTickets(
       !!lastNudgeAtMs &&
       (!lastStaffReplyAtMs || lastNudgeAtMs > lastStaffReplyAtMs);
 
+    const score = scoreMap.get(t.id);
+
+    const smartUrgencyScore =
+      t.status === "closed" ? null : score?.urgency_score ?? null;
+    const smartTimeScore = t.status === "closed" ? null : score?.time_score ?? null;
+    const smartComputedAt =
+      t.status === "closed" ? null : score?.computed_at ?? null;
+
     return {
       ...(t as any),
       nudge_last_at: lastNudgeAtRawByTicket.get(t.id) ?? null,
       nudge_pending: nudgePending,
+      smart_urgency_score: smartUrgencyScore,
+      smart_time_score: smartTimeScore,
+      smart_computed_at: smartComputedAt,
     } as AdminTicketListItem;
   });
 
   if (sort !== "smart") return withNudgeInfo;
 
-  const scoreMap = await getTicketSmartScores(ticketIds);
   const scored = withNudgeInfo.map((t) => {
-    const score = scoreMap.get(t.id);
-    const urgencyScore = score?.urgency_score ?? 0;
+    const urgencyScore = t.smart_urgency_score ?? 0;
     const updatedMs = new Date(t.updated_at).getTime();
     const createdMs = new Date(t.created_at).getTime();
     const fallbackTimeScore =
       (Number.isFinite(updatedMs) ? updatedMs : 0) * 0.7 +
       (Number.isFinite(createdMs) ? createdMs : 0) * 0.3;
-    const timeScore = score?.time_score ?? fallbackTimeScore;
+    const timeScore = t.smart_time_score ?? fallbackTimeScore;
     return { t, urgencyScore, timeScore };
   });
 
