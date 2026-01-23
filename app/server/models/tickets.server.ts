@@ -1,5 +1,15 @@
 import { getSupabaseAdminDb } from "../supabase.server";
 import type { TicketStatus } from "../../shared/tickets";
+import { listAllTickets } from "./admin.server";
+
+export const TICKET_NUDGE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+const OPEN_TICKET_STATUSES: TicketStatus[] = [
+  "pending_assign",
+  "assigned",
+  "replied_by_staff",
+  "replied_by_customer",
+];
 
 export type TicketListItem = {
   id: string;
@@ -35,6 +45,104 @@ export type TicketMessage = {
   body_markdown: string;
   created_at: string;
 };
+
+export async function getLatestTicketNudgeAt(ticketId: string): Promise<string | null> {
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("ticket_nudges")
+    .select("created_at")
+    .eq("ticket_id", ticketId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(`读取催单记录失败：${error.message}`);
+  return ((data ?? [])[0] as any)?.created_at ?? null;
+}
+
+export async function createTicketNudge(params: {
+  uid: number;
+  ticketId: string;
+}): Promise<{ nudgeId: string }> {
+  const supabase = getSupabaseAdminDb();
+
+  const { data: t, error: tErr } = await supabase
+    .from("tickets")
+    .select("id,creator_uid,status,created_at")
+    .eq("id", params.ticketId)
+    .maybeSingle();
+  if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
+  if (!t || (t as any).creator_uid !== params.uid) {
+    throw new Error("工单不存在或无权限。");
+  }
+  if ((t as any).status === "closed") {
+    throw new Error("工单已关闭，无法催单。");
+  }
+
+  const ticketCreatedAt = new Date((t as any).created_at).getTime();
+  if (!Number.isFinite(ticketCreatedAt)) throw new Error("工单创建时间无效。");
+
+  const { data: nudges, error: nErr } = await supabase
+    .from("ticket_nudges")
+    .select("id,created_at")
+    .eq("ticket_id", params.ticketId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (nErr) throw new Error(`读取催单记录失败：${nErr.message}`);
+  const lastNudgeAtRaw = ((nudges ?? [])[0] as any)?.created_at as string | undefined;
+  const lastNudgeAt = lastNudgeAtRaw ? new Date(lastNudgeAtRaw).getTime() : null;
+
+  const baseMs = Math.max(ticketCreatedAt, lastNudgeAt ?? 0);
+  const nextAllowedAtMs = baseMs + TICKET_NUDGE_COOLDOWN_MS;
+  const nowMs = Date.now();
+
+  if (nowMs < nextAllowedAtMs) {
+    if (!lastNudgeAtRaw) {
+      throw new Error("工单刚创建，暂时无法催单（创建后 6 小时可催单）。");
+    }
+    throw new Error("距离上次催单不足 6 小时，请稍后再试。");
+  }
+
+  const { data: nudge, error: insErr } = await supabase
+    .from("ticket_nudges")
+    .insert({
+      ticket_id: params.ticketId,
+      requester_uid: params.uid,
+    })
+    .select("id")
+    .single();
+  if (insErr) throw new Error(`催单失败：${insErr.message}`);
+  const nudgeId = (nudge as any).id as string;
+
+  const { error: msgErr } = await supabase.from("ticket_messages").insert({
+    ticket_id: params.ticketId,
+    actor: "system",
+    body_markdown: "客户发起了催单，请尽快处理。",
+  });
+
+  if (msgErr) {
+    try {
+      await supabase.from("ticket_nudges").delete().eq("id", nudgeId);
+    } catch {
+      // best-effort rollback
+    }
+    throw new Error(`创建系统消息失败：${msgErr.message}`);
+  }
+
+  return { nudgeId };
+}
+
+export async function getSmartQueuePositionForTicket(ticketId: string): Promise<{
+  position: number;
+  total: number;
+} | null> {
+  const tickets = await listAllTickets({
+    statuses: OPEN_TICKET_STATUSES,
+    sort: "smart",
+    sortDirection: "desc",
+  });
+  const index = tickets.findIndex((t) => t.id === ticketId);
+  if (index < 0) return null;
+  return { position: index + 1, total: tickets.length };
+}
 
 export async function listTicketsForUser(uid: number): Promise<TicketListItem[]> {
   const supabase = getSupabaseAdminDb();

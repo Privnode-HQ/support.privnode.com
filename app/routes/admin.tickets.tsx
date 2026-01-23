@@ -16,6 +16,8 @@ import {
 } from "react-router";
 import { requireAdmin } from "../server/admin";
 import {
+  type AdminTicketSort,
+  type AdminTicketSortDirection,
   listAllCategories,
   listAllTickets,
   listAllUsers,
@@ -39,6 +41,53 @@ function asTicketStatus(value: string | null): TicketStatus | null {
   return null;
 }
 
+function parseTicketStatuses(values: string[]): TicketStatus[] {
+  const set = new Set<TicketStatus>();
+  for (const v of values) {
+    const parsed = asTicketStatus(v);
+    if (parsed) set.add(parsed);
+  }
+  return Array.from(set);
+}
+
+function parseAssignedFilters(values: string[], myUid: number): {
+  selected: string[];
+  unassigned: boolean;
+  assignedToUids: number[];
+} {
+  const selected: string[] = [];
+  let unassigned = false;
+  const assignedToUids: number[] = [];
+
+  for (const raw of values) {
+    if (!raw || raw === "all") continue;
+    if (raw === "unassigned") {
+      selected.push(raw);
+      unassigned = true;
+      continue;
+    }
+    if (raw === "me") {
+      selected.push(raw);
+      assignedToUids.push(myUid);
+      continue;
+    }
+    if (raw.startsWith("uid:")) {
+      const uid = Number(raw.slice("uid:".length));
+      if (Number.isFinite(uid)) {
+        const normalized = `uid:${uid}`;
+        selected.push(normalized);
+        assignedToUids.push(uid);
+      }
+    }
+  }
+
+  return {
+    selected: Array.from(new Set(selected)),
+    unassigned,
+    assignedToUids: Array.from(new Set(assignedToUids)),
+  };
+}
+
 function formatCompactDateTime(ts: string) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts;
@@ -55,35 +104,30 @@ export async function loader({ request }: Route.LoaderArgs) {
   const admin = await requireAdmin(request);
   const url = new URL(request.url);
 
-  const statusParam = url.searchParams.get("status");
-  const assignedParam = url.searchParams.get("assigned");
+  const statusParams = url.searchParams.getAll("status");
+  const assignedParams = url.searchParams.getAll("assigned");
+  const sortParam = String(url.searchParams.get("sort") ?? "");
+  const dirParam = String(url.searchParams.get("dir") ?? "");
   const q = String(url.searchParams.get("q") ?? "").trim();
 
-  const status = asTicketStatus(statusParam);
-
-  const normalizedAssigned =
-    assignedParam === "unassigned" ||
-    assignedParam === "me" ||
-    assignedParam?.startsWith("uid:")
-      ? assignedParam
-      : "all";
-
-  const assignedToUid =
-    normalizedAssigned === "me"
-      ? admin.uid
-      : normalizedAssigned?.startsWith("uid:")
-        ? Number(normalizedAssigned.slice("uid:".length))
-        : null;
-  const unassigned = normalizedAssigned === "unassigned";
+  const statuses = parseTicketStatuses(statusParams);
+  const assigned = parseAssignedFilters(assignedParams, admin.uid);
+  const sort: AdminTicketSort =
+    sortParam === "created_at" || sortParam === "updated_at" || sortParam === "smart"
+      ? sortParam
+      : "updated_at";
+  const dir: AdminTicketSortDirection =
+    dirParam === "asc" || dirParam === "desc" ? dirParam : "desc";
 
   const [tickets, categories, users] = await Promise.all([
     listAllTickets({
-      status: status ?? undefined,
-      unassigned,
-      assignedToUid: Number.isFinite(assignedToUid as any)
-        ? (assignedToUid as number)
-        : undefined,
+      statuses: statuses.length > 0 ? statuses : undefined,
+      unassigned: assigned.unassigned,
+      assignedToUids:
+        assigned.assignedToUids.length > 0 ? assigned.assignedToUids : undefined,
       query: q || undefined,
+      sort,
+      sortDirection: dir,
     }),
     listAllCategories(),
     listAllUsers(),
@@ -95,9 +139,11 @@ export async function loader({ request }: Route.LoaderArgs) {
     categories,
     users,
     filters: {
-      status: status ?? "all",
-      assigned: normalizedAssigned ?? "all",
+      statuses,
+      assigned: assigned.selected,
       q,
+      sort,
+      dir,
     },
   });
 }
@@ -121,6 +167,30 @@ function StatusChip({ status }: { status: string }) {
   );
 }
 
+function FilterChipCheckbox(props: {
+  name: string;
+  value: string;
+  label: string;
+  defaultChecked: boolean;
+  onChange: (form: HTMLFormElement | null) => void;
+}) {
+  return (
+    <label className="inline-flex items-center cursor-pointer select-none">
+      <input
+        type="checkbox"
+        name={props.name}
+        value={props.value}
+        defaultChecked={props.defaultChecked}
+        onChange={(e) => props.onChange(e.currentTarget.form)}
+        className="sr-only peer"
+      />
+      <span className="inline-flex items-center rounded-medium border border-default-200 px-2 py-1 text-xs bg-background text-default-700 peer-checked:bg-default-100 peer-checked:border-default-400 peer-checked:text-foreground">
+        {props.label}
+      </span>
+    </label>
+  );
+}
+
 export default function AdminTickets({ loaderData }: Route.ComponentProps) {
   const categoryMap = new Map(loaderData.categories.map((c) => [c.id, c.name]));
   const userMap = new Map(
@@ -136,13 +206,33 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
   const selectedTicketId = params.ticketId;
   const detailScrollRef = useRef<HTMLDivElement | null>(null);
 
+  const submitTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (submitTimerRef.current) {
+        window.clearTimeout(submitTimerRef.current);
+        submitTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const submitFilters = (form: HTMLFormElement | null) => {
+    if (!form) return;
+    if (submitTimerRef.current) window.clearTimeout(submitTimerRef.current);
+    submitTimerRef.current = window.setTimeout(() => {
+      submit(form, { replace: true });
+    }, 250);
+  };
+
   useEffect(() => {
     detailScrollRef.current?.scrollTo({ top: 0 });
   }, [selectedTicketId]);
 
-  const statusValue = String(loaderData.filters.status ?? "all");
-  const assignedValue = String(loaderData.filters.assigned ?? "all");
+  const selectedStatuses = loaderData.filters.statuses ?? [];
+  const selectedAssigned = loaderData.filters.assigned ?? [];
   const qValue = String(loaderData.filters.q ?? "");
+  const sortValue = String(loaderData.filters.sort ?? "updated_at");
+  const dirValue = String(loaderData.filters.dir ?? "desc");
 
   return (
     <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-2 overflow-hidden">
@@ -165,47 +255,61 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
             </Button>
           </div>
 
-          <Form method="get" replace className="mt-2 grid grid-cols-2 gap-2">
+          <Form
+            key={location.search}
+            method="get"
+            replace
+            className="mt-2 grid grid-cols-2 gap-2"
+          >
             <label className="text-xs text-default-600">
               状态
-              <select
-                name="status"
-                defaultValue={statusValue}
-                onChange={(e) => {
-                  const form = e.currentTarget.form;
-                  if (form) submit(form, { replace: true });
-                }}
-                className="mt-1 block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
-              >
-                <option value="all">全部</option>
+              <div className="mt-1 flex flex-wrap gap-1">
                 {ALL_TICKET_STATUSES.map((s) => (
-                  <option key={s} value={s}>
-                    {ticketStatusLabel(s)}
-                  </option>
+                  <FilterChipCheckbox
+                    key={s}
+                    name="status"
+                    value={s}
+                    label={ticketStatusLabel(s)}
+                    defaultChecked={selectedStatuses.includes(s)}
+                    onChange={submitFilters}
+                  />
                 ))}
-              </select>
+              </div>
+              <div className="mt-1 text-[11px] text-default-500">不选择 = 全部</div>
             </label>
 
             <label className="text-xs text-default-600">
               分配
-              <select
-                name="assigned"
-                defaultValue={assignedValue}
-                onChange={(e) => {
-                  const form = e.currentTarget.form;
-                  if (form) submit(form, { replace: true });
-                }}
-                className="mt-1 block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
-              >
-                <option value="all">全部</option>
-                <option value="unassigned">未分配</option>
-                <option value="me">分配给我</option>
-                {adminUsers.map((u) => (
-                  <option key={u.uid} value={`uid:${u.uid}`}>
-                    {u.display_name ?? u.username}
-                  </option>
-                ))}
-              </select>
+              <div className="mt-1 flex flex-wrap gap-1">
+                <FilterChipCheckbox
+                  name="assigned"
+                  value="unassigned"
+                  label="未分配"
+                  defaultChecked={selectedAssigned.includes("unassigned")}
+                  onChange={submitFilters}
+                />
+                <FilterChipCheckbox
+                  name="assigned"
+                  value="me"
+                  label="分配给我"
+                  defaultChecked={selectedAssigned.includes("me")}
+                  onChange={submitFilters}
+                />
+                {adminUsers.map((u) => {
+                  const val = `uid:${u.uid}`;
+                  return (
+                    <FilterChipCheckbox
+                      key={val}
+                      name="assigned"
+                      value={val}
+                      label={u.display_name ?? u.username}
+                      defaultChecked={selectedAssigned.includes(val)}
+                      onChange={submitFilters}
+                    />
+                  );
+                })}
+              </div>
+              <div className="mt-1 text-[11px] text-default-500">不选择 = 全部</div>
             </label>
 
             <div className="col-span-2 flex gap-2">
@@ -218,6 +322,33 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                   className="block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
                 />
               </label>
+
+              <label className="w-[8.5rem]">
+                <span className="sr-only">排序方式</span>
+                <select
+                  name="sort"
+                  defaultValue={sortValue}
+                  onChange={(e) => submitFilters(e.currentTarget.form)}
+                  className="block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
+                >
+                  <option value="updated_at">按更新时间</option>
+                  <option value="created_at">按创建时间</option>
+                  <option value="smart">智能排序</option>
+                </select>
+              </label>
+              <label className="w-[6rem]">
+                <span className="sr-only">排序方向</span>
+                <select
+                  name="dir"
+                  defaultValue={dirValue}
+                  onChange={(e) => submitFilters(e.currentTarget.form)}
+                  className="block w-full h-8 rounded-medium border border-default-200 bg-background px-2 text-sm"
+                >
+                  <option value="desc">倒序</option>
+                  <option value="asc">正序</option>
+                </select>
+              </label>
+
               <Button
                 type="submit"
                 variant="flat"
@@ -269,6 +400,18 @@ export default function AdminTickets({ loaderData }: Route.ComponentProps) {
                           <span className="font-mono text-xs text-default-500">
                             #{t.short_id}
                           </span>
+                          {t.nudge_pending ? (
+                            <span
+                              title={
+                                t.nudge_last_at
+                                  ? `客户催单：${formatCompactDateTime(t.nudge_last_at)}`
+                                  : "客户催单"
+                              }
+                              className="text-warning text-xs"
+                            >
+                              ★
+                            </span>
+                          ) : null}
                           <div className="text-sm font-medium truncate">
                             {t.subject}
                           </div>

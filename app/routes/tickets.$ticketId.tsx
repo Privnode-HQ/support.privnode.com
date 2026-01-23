@@ -22,12 +22,15 @@ import { ticketStatusLabel } from "../shared/tickets";
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const { requireUser } = await import("../server/auth");
-  const { getTicketForUser, listMessages } = await import(
-    "../server/models/tickets.server"
-  );
-  const { listAttachmentsForTicket } = await import(
-    "../server/models/attachments.server"
-  );
+  const {
+    TICKET_NUDGE_COOLDOWN_MS,
+    getLatestTicketNudgeAt,
+    getSmartQueuePositionForTicket,
+    getTicketForUser,
+    listMessages,
+  } = await import("../server/models/tickets.server");
+  const { listAttachmentsForTicket } =
+    await import("../server/models/attachments.server");
   const { processTicketLinks } = await import("../server/markdown.server");
 
   const user = await requireUser(request);
@@ -37,30 +40,67 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   if (!ticket) {
     throw new Response("Not Found", { status: 404 });
   }
-  const [messages, attachments] = await Promise.all([
+
+  const smartQueuePromise =
+    ticket.status === "closed"
+      ? Promise.resolve(null)
+      : getSmartQueuePositionForTicket(ticketId).catch(() => null);
+
+  const [messages, attachments, lastNudgedAt, smartQueue] = await Promise.all([
     listMessages(ticketId),
     listAttachmentsForTicket(ticketId),
+    getLatestTicketNudgeAt(ticketId),
+    smartQueuePromise,
   ]);
 
   // Process ticket links in message markdown
   const processedMessages = await Promise.all(
     messages.map(async (msg) => ({
       ...msg,
-      body_markdown: await processTicketLinks(msg.body_markdown, user.uid, false),
-    }))
+      body_markdown: await processTicketLinks(
+        msg.body_markdown,
+        user.uid,
+        false,
+      ),
+    })),
   );
 
-  return data({ ticket, messages: processedMessages, attachments });
+  const nowMs = Date.now();
+  const createdAtMs = new Date(ticket.created_at).getTime();
+  const lastNudgedAtMs = lastNudgedAt ? new Date(lastNudgedAt).getTime() : null;
+  const baseMs = Math.max(createdAtMs, lastNudgedAtMs ?? 0);
+  const nextAllowedAtMs = baseMs + TICKET_NUDGE_COOLDOWN_MS;
+  const canNudge = ticket.status !== "closed" && nowMs >= nextAllowedAtMs;
+
+  const nudgeDisabledReason =
+    ticket.status === "closed"
+      ? "工单已关闭。"
+      : canNudge
+        ? null
+        : lastNudgedAt
+          ? "距离上次催单不足 6 小时。"
+          : "工单创建后 6 小时内无法催单。";
+
+  return data({
+    ticket,
+    messages: processedMessages,
+    attachments,
+    nudge: {
+      last_nudged_at: lastNudgedAt,
+      next_allowed_at: new Date(nextAllowedAtMs).toISOString(),
+      can_nudge: canNudge,
+      disabled_reason: nudgeDisabledReason,
+    },
+    queue: smartQueue,
+  });
 }
 
 export async function action({ request, params }: Route.ActionArgs) {
   const { requireUser } = await import("../server/auth");
-  const { addCustomerReply, closeTicket } = await import(
-    "../server/models/tickets.server"
-  );
-  const { uploadAttachments } = await import(
-    "../server/models/attachments.server"
-  );
+  const { addCustomerReply, closeTicket, createTicketNudge } =
+    await import("../server/models/tickets.server");
+  const { uploadAttachments } =
+    await import("../server/models/attachments.server");
 
   const user = await requireUser(request);
   const ticketId = params.ticketId;
@@ -76,7 +116,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     if (!bodyMarkdown) {
       return data(
         { ok: false as const, error: "回复内容不能为空。" },
-        { status: 400 }
+        { status: 400 },
       );
     }
     const { messageId } = await addCustomerReply({
@@ -98,11 +138,9 @@ export async function action({ request, params }: Route.ActionArgs) {
         {
           ok: false as const,
           error:
-            e instanceof Error
-              ? e.message
-              : "附件上传失败（回复已发送）。",
+            e instanceof Error ? e.message : "附件上传失败（回复已发送）。",
         },
-        { status: 400 }
+        { status: 400 },
       );
     }
     return redirect(`/tickets/${ticketId}`);
@@ -114,10 +152,22 @@ export async function action({ request, params }: Route.ActionArgs) {
     return redirect(`/tickets/${ticketId}`);
   }
 
-  return data(
-    { ok: false as const, error: "未知操作。" },
-    { status: 400 }
-  );
+  if (intent === "nudge") {
+    try {
+      await createTicketNudge({ uid: user.uid, ticketId });
+    } catch (e: any) {
+      return data(
+        {
+          ok: false as const,
+          error: e instanceof Error ? e.message : "催单失败。",
+        },
+        { status: 400 },
+      );
+    }
+    return redirect(`/tickets/${ticketId}`);
+  }
+
+  return data({ ok: false as const, error: "未知操作。" }, { status: 400 });
 }
 
 function ActorLabel(actor: string, name: string | null) {
@@ -128,8 +178,11 @@ function ActorLabel(actor: string, name: string | null) {
   return actor;
 }
 
-export default function TicketDetail({ loaderData, actionData }: Route.ComponentProps) {
-  const { ticket, messages, attachments } = loaderData;
+export default function TicketDetail({
+  loaderData,
+  actionData,
+}: Route.ComponentProps) {
+  const { ticket, messages, attachments, nudge, queue } = loaderData;
   const { isOpen, onOpen, onClose } = useDisclosure();
 
   // Reverse messages to show newest first
@@ -207,6 +260,19 @@ export default function TicketDetail({ loaderData, actionData }: Route.Component
             <Chip color={statusColor as any} variant="flat">
               {ticketStatusLabel(ticket.status as any)}
             </Chip>
+            {ticket.status !== "closed" ? (
+              <Form method="post">
+                <input type="hidden" name="_intent" value="nudge" />
+                <Button
+                  type="submit"
+                  color="warning"
+                  variant="flat"
+                  isDisabled={!nudge.can_nudge}
+                >
+                  催单
+                </Button>
+              </Form>
+            ) : null}
             {ticket.status !== "closed" && (
               <Button color="danger" variant="flat" onPress={onOpen}>
                 关闭工单
@@ -216,9 +282,23 @@ export default function TicketDetail({ loaderData, actionData }: Route.Component
         </div>
 
         <div className="text-sm text-default-500">
-          创建时间：{new Date(ticket.created_at).toLocaleString("zh-CN")} · 更新时间：
+          创建时间：{new Date(ticket.created_at).toLocaleString("zh-CN")} ·
+          更新时间：
           {new Date(ticket.updated_at).toLocaleString("zh-CN")}
         </div>
+
+        {ticket.status !== "closed" && queue ? (
+          <div className="text-xs text-default-500">
+            队列位置：第 {queue.position} / {queue.total}
+          </div>
+        ) : null}
+
+        {ticket.status !== "closed" && !nudge.can_nudge ? (
+          <div className="text-xs text-default-500">
+            {nudge.disabled_reason ?? "暂时无法催单。"} 下次可在{" "}
+            {new Date(nudge.next_allowed_at).toLocaleString("zh-CN")} 之后催单。
+          </div>
+        ) : null}
 
         {ticket.status === "closed" ? (
           <div className="text-sm text-default-600">
@@ -260,11 +340,15 @@ export default function TicketDetail({ loaderData, actionData }: Route.Component
                     附件：
                     {attachmentsByMessage.get(m.id)!.map((a) => (
                       <span key={a.id} className="ml-2">
-                        <a className="text-primary underline" href={`/attachments/${a.id}`}>
+                        <a
+                          className="text-primary underline"
+                          href={`/attachments/${a.id}`}
+                        >
                           {a.filename}
                         </a>
                         <span className="text-xs text-default-500">
-                          {" "}({Math.ceil(a.size_bytes / 1024)} KB)
+                          {" "}
+                          ({Math.ceil(a.size_bytes / 1024)} KB)
                         </span>
                       </span>
                     ))}
