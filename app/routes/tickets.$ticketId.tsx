@@ -17,7 +17,14 @@ import {
 import { Form, Link, data, redirect } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { memo, useMemo } from "react";
 import { ticketStatusLabel } from "../shared/tickets";
+
+const MARKDOWN_PLUGINS = [remarkGfm];
+
+type TicketDetailLoaderData = Route.ComponentProps["loaderData"];
+type TicketMessage = TicketDetailLoaderData["messages"][number];
+type TicketAttachment = TicketDetailLoaderData["attachments"][number];
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const { requireUser } = await import("../server/auth");
@@ -31,7 +38,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   } = await import("../server/models/tickets.server");
   const { listAttachmentsForTicket } =
     await import("../server/models/attachments.server");
-  const { processTicketLinks } = await import("../server/markdown.server");
+  const { processTicketLinksInManyMarkdowns } = await import(
+    "../server/markdown.server"
+  );
 
   const user = await requireUser(request);
   const ticketId = params.ticketId;
@@ -58,16 +67,15 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     ]);
 
   // Process ticket links in message markdown
-  const processedMessages = await Promise.all(
-    messages.map(async (msg) => ({
-      ...msg,
-      body_markdown: await processTicketLinks(
-        msg.body_markdown,
-        user.uid,
-        false,
-      ),
-    })),
+  const processedBodies = await processTicketLinksInManyMarkdowns(
+    messages.map((m) => m.body_markdown),
+    user.uid,
+    false,
   );
+  const processedMessages = messages.map((msg, i) => ({
+    ...msg,
+    body_markdown: processedBodies[i] ?? msg.body_markdown,
+  }));
 
   const nowMs = Date.now();
   const createdAtMs = new Date(ticket.created_at).getTime();
@@ -205,6 +213,50 @@ function ActorLabel(actor: string, name: string | null) {
   return actor;
 }
 
+const MessageCard = memo(function MessageCard(props: {
+  message: TicketMessage;
+  attachments: TicketAttachment[];
+}) {
+  const m = props.message;
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div className="text-sm font-medium">
+            {ActorLabel(m.actor, m.author_display_name)}
+          </div>
+          <div className="text-xs text-default-500">
+            {new Date(m.created_at).toLocaleString("zh-CN")}
+          </div>
+        </div>
+
+        <div className="prose prose-sm max-w-none dark:prose-invert">
+          <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS}>
+            {m.body_markdown}
+          </ReactMarkdown>
+        </div>
+
+        {props.attachments.length ? (
+          <div className="text-sm text-default-600">
+            附件：
+            {props.attachments.map((a) => (
+              <span key={a.id} className="ml-2">
+                <a className="text-primary underline" href={`/attachments/${a.id}`}>
+                  {a.filename}
+                </a>
+                <span className="text-xs text-default-500">
+                  {" "}
+                  ({Math.ceil(a.size_bytes / 1024)} KB)
+                </span>
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+});
+
 export default function TicketDetail({
   loaderData,
   actionData,
@@ -214,15 +266,19 @@ export default function TicketDetail({
   const { isOpen, onOpen, onClose } = useDisclosure();
 
   // Reverse messages to show newest first
-  const reversedMessages = [...messages].reverse();
+  const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
 
-  const attachmentsByMessage = new Map<string, typeof attachments>();
-  for (const a of attachments) {
-    if (!a.message_id) continue;
-    const list = attachmentsByMessage.get(a.message_id) ?? [];
-    list.push(a);
-    attachmentsByMessage.set(a.message_id, list);
-  }
+  const attachmentsByMessage = useMemo(() => {
+    const map = new Map<string, TicketAttachment[]>();
+    for (const a of attachments) {
+      const messageId = String((a as any).message_id ?? "");
+      if (!messageId) continue;
+      const list = map.get(messageId) ?? [];
+      list.push(a);
+      map.set(messageId, list);
+    }
+    return map;
+  }, [attachments]);
 
   const statusColor =
     ticket.status === "closed"
@@ -389,43 +445,11 @@ export default function TicketDetail({
           <p className="text-default-600">暂无消息。</p>
         ) : (
           reversedMessages.map((m) => (
-            <Card key={m.id}>
-              <CardBody className="space-y-3">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="text-sm font-medium">
-                    {ActorLabel(m.actor, m.author_display_name)}
-                  </div>
-                  <div className="text-xs text-default-500">
-                    {new Date(m.created_at).toLocaleString("zh-CN")}
-                  </div>
-                </div>
-                <div className="prose prose-sm max-w-none dark:prose-invert">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {m.body_markdown}
-                  </ReactMarkdown>
-                </div>
-
-                {attachmentsByMessage.get(m.id)?.length ? (
-                  <div className="text-sm text-default-600">
-                    附件：
-                    {attachmentsByMessage.get(m.id)!.map((a) => (
-                      <span key={a.id} className="ml-2">
-                        <a
-                          className="text-primary underline"
-                          href={`/attachments/${a.id}`}
-                        >
-                          {a.filename}
-                        </a>
-                        <span className="text-xs text-default-500">
-                          {" "}
-                          ({Math.ceil(a.size_bytes / 1024)} KB)
-                        </span>
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-              </CardBody>
-            </Card>
+            <MessageCard
+              key={m.id}
+              message={m}
+              attachments={attachmentsByMessage.get(m.id) ?? []}
+            />
           ))
         )}
       </div>

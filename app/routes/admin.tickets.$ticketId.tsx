@@ -1,4 +1,5 @@
 import type { Route } from "./+types/admin.tickets.$ticketId";
+import type { Route as AdminTicketsRoute } from "./+types/admin.tickets";
 import {
   Button,
   Card,
@@ -16,17 +17,16 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { Form, Link, data, redirect } from "react-router";
+import { Form, Link, data, redirect, useOutletContext } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { memo, useMemo } from "react";
 import { requireAdmin } from "../server/admin";
 import {
   addAdminReply,
   assignTicket,
   closeTicketAsAdmin,
   getTicketById,
-  listAllCategories,
-  listAllUsers,
   purgeTicketAsAdmin,
   purgeTicketMessageAsAdmin,
   restoreTicketAsAdmin,
@@ -42,28 +42,42 @@ import {
   uploadAttachments,
 } from "../server/models/attachments.server";
 
+const MARKDOWN_PLUGINS = [remarkGfm];
+
+type AdminTicketDetailLoaderData = Route.ComponentProps["loaderData"];
+type TicketMessage = AdminTicketDetailLoaderData["messages"][number];
+type TicketAttachment = AdminTicketDetailLoaderData["attachments"][number];
+
+type AdminTicketsOutletContext = Pick<
+  AdminTicketsRoute.ComponentProps["loaderData"],
+  "categories" | "users"
+>;
+
 export async function loader({ request, params }: Route.LoaderArgs) {
   const admin = await requireAdmin(request);
   const ticketId = params.ticketId;
-  const { processTicketLinks } = await import("../server/markdown.server");
+  const { processTicketLinksInManyMarkdowns } = await import(
+    "../server/markdown.server"
+  );
 
-  const [ticket, messages, attachments, participants, categories, users] = await Promise.all([
+  const [ticket, messages, attachments, participants] = await Promise.all([
     getTicketById(ticketId),
     listMessages(ticketId, { includeDeleted: true }),
     listAttachmentsForTicket(ticketId),
     listParticipantsForTicket(ticketId),
-    listAllCategories(),
-    listAllUsers(),
   ]);
   if (!ticket) throw new Response("Not Found", { status: 404 });
 
   // Process ticket links in message markdown (admin can access all tickets)
-  const processedMessages = await Promise.all(
-    messages.map(async (msg) => ({
-      ...msg,
-      body_markdown: await processTicketLinks(msg.body_markdown, admin.uid, true),
-    }))
+  const processedBodies = await processTicketLinksInManyMarkdowns(
+    messages.map((m) => m.body_markdown),
+    admin.uid,
+    true,
   );
+  const processedMessages = messages.map((msg, i) => ({
+    ...msg,
+    body_markdown: processedBodies[i] ?? msg.body_markdown,
+  }));
 
   return data({
     admin: { uid: admin.uid },
@@ -71,8 +85,6 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     messages: processedMessages,
     attachments,
     participants,
-    categories,
-    users,
   });
 }
 
@@ -311,30 +323,161 @@ function ActorLabel(actor: string, name: string | null) {
   return actor;
 }
 
+const MessageCard = memo(function MessageCard(props: {
+  message: TicketMessage;
+  deletedByLabel: string | null;
+  attachments: TicketAttachment[];
+}) {
+  const m = props.message;
+  const isMsgDeleted = Boolean(m.deleted_at);
+
+  return (
+    <Card
+      className={[
+        "shadow-none border border-default-200",
+        isMsgDeleted ? "opacity-60" : "",
+      ].join(" ")}
+    >
+      <CardBody className="space-y-2 px-3 py-2">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <div className="text-sm font-medium">
+                {ActorLabel(m.actor, m.author_display_name)}
+              </div>
+              {isMsgDeleted ? (
+                <Chip color="danger" variant="flat" size="sm">
+                  已删除
+                </Chip>
+              ) : null}
+            </div>
+            <div className="text-xs text-default-500">
+              {new Date(m.created_at).toLocaleString("zh-CN")}
+            </div>
+          </div>
+
+          <div className="shrink-0 flex items-center gap-2">
+            {isMsgDeleted ? (
+              <>
+                <Form method="post">
+                  <input type="hidden" name="_intent" value="restoreMessage" />
+                  <input type="hidden" name="messageId" value={m.id} />
+                  <Button size="sm" variant="flat" color="primary" type="submit">
+                    恢复
+                  </Button>
+                </Form>
+                <Form
+                  method="post"
+                  onSubmit={(e) => {
+                    if (
+                      !window.confirm(
+                        "确认彻底删除该条消息？彻底删除后管理员端也不显示，但数据库仍保留记录。",
+                      )
+                    ) {
+                      e.preventDefault();
+                    }
+                  }}
+                >
+                  <input type="hidden" name="_intent" value="purgeMessage" />
+                  <input type="hidden" name="messageId" value={m.id} />
+                  <Button size="sm" variant="flat" color="danger" type="submit">
+                    彻底删除
+                  </Button>
+                </Form>
+              </>
+            ) : (
+              <Form
+                method="post"
+                onSubmit={(e) => {
+                  if (!window.confirm("确认删除该条消息？")) {
+                    e.preventDefault();
+                  }
+                }}
+              >
+                <input type="hidden" name="_intent" value="deleteMessage" />
+                <input type="hidden" name="messageId" value={m.id} />
+                <Button size="sm" variant="light" color="danger" type="submit">
+                  删除
+                </Button>
+              </Form>
+            )}
+          </div>
+        </div>
+
+        {isMsgDeleted ? (
+          <div className="text-xs text-danger">
+            已删除：
+            {m.deleted_at ? new Date(m.deleted_at).toLocaleString("zh-CN") : "-"}
+            {props.deletedByLabel ? ` · 操作人：${props.deletedByLabel}` : ""}
+          </div>
+        ) : null}
+
+        <div className="prose prose-sm max-w-none dark:prose-invert">
+          <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS}>
+            {m.body_markdown}
+          </ReactMarkdown>
+        </div>
+
+        {props.attachments.length ? (
+          <div className="text-sm text-default-600">
+            附件：
+            {props.attachments.map((a) => (
+              <span key={a.id} className="ml-2">
+                <a
+                  className="text-primary underline"
+                  href={`/attachments/${a.id}`}
+                >
+                  {a.filename}
+                </a>
+                <span className="text-xs text-default-500">
+                  {" "}
+                  ({Math.ceil(a.size_bytes / 1024)} KB)
+                </span>
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+});
+
 export default function AdminTicketDetail({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const { ticket, messages, attachments, participants, categories, users } = loaderData;
-  const categoryMap = new Map(categories.map((c) => [c.id, c.name]));
-  const userMap = new Map(users.map((u) => [u.uid, u.display_name ?? u.username]));
+  const { categories, users } = useOutletContext<AdminTicketsOutletContext>();
+  const { ticket, messages, attachments, participants } = loaderData;
+  const categoryMap = useMemo(
+    () => new Map(categories.map((c) => [c.id, c.name])),
+    [categories],
+  );
+  const userMap = useMemo(
+    () =>
+      new Map(users.map((u) => [u.uid, u.display_name ?? u.username])),
+    [users],
+  );
   const { isOpen, onOpen, onClose } = useDisclosure();
   const deleteModal = useDisclosure();
   const purgeModal = useDisclosure();
   const isDeleted = Boolean(ticket.deleted_at);
 
   // Reverse messages to show newest first
-  const reversedMessages = [...messages].reverse();
+  const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
 
-  const attachmentsByMessage = new Map<string, typeof attachments>();
-  for (const a of attachments) {
-    if (!a.message_id) continue;
-    const list = attachmentsByMessage.get(a.message_id) ?? [];
-    list.push(a);
-    attachmentsByMessage.set(a.message_id, list);
-  }
+  const attachmentsByMessage = useMemo(() => {
+    const map = new Map<string, TicketAttachment[]>();
+    for (const a of attachments) {
+      const messageId = String((a as any).message_id ?? "");
+      if (!messageId) continue;
+      const list = map.get(messageId) ?? [];
+      list.push(a);
+      map.set(messageId, list);
+    }
+    return map;
+  }, [attachments]);
 
-  const participantsWithCreator = (() => {
+  const participantsWithCreator = useMemo(() => {
     if (ticket.is_global) return [];
     const uidSet = new Set(participants.map((p) => p.uid));
     const list = [...participants];
@@ -350,7 +493,7 @@ export default function AdminTicketDetail({
       }
     }
     return list;
-  })();
+  }, [participants, ticket.creator_uid, ticket.is_global, users]);
 
   const statusColor =
     ticket.status === "closed"
@@ -584,130 +727,18 @@ export default function AdminTicketDetail({
         ) : (
           <div className="space-y-2">
             {reversedMessages.map((m) => {
-              const isMsgDeleted = Boolean(m.deleted_at);
-              const deletedBy =
+              const deletedByLabel =
                 m.deleted_by_uid != null
                   ? userMap.get(m.deleted_by_uid) ?? `uid:${m.deleted_by_uid}`
                   : null;
+              const msgAttachments = attachmentsByMessage.get(m.id) ?? [];
               return (
-              <Card
-                key={m.id}
-                className={[
-                  "shadow-none border border-default-200",
-                  isMsgDeleted ? "opacity-60" : "",
-                ].join(" ")}
-              >
-                <CardBody className="space-y-2 px-3 py-2">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <div className="text-sm font-medium">
-                          {ActorLabel(m.actor, m.author_display_name)}
-                        </div>
-                        {isMsgDeleted ? (
-                          <Chip color="danger" variant="flat" size="sm">
-                            已删除
-                          </Chip>
-                        ) : null}
-                      </div>
-                      <div className="text-xs text-default-500">
-                        {new Date(m.created_at).toLocaleString("zh-CN")}
-                      </div>
-                    </div>
-
-                    <div className="shrink-0 flex items-center gap-2">
-                      {isMsgDeleted ? (
-                        <>
-                          <Form method="post">
-                            <input
-                              type="hidden"
-                              name="_intent"
-                              value="restoreMessage"
-                            />
-                            <input type="hidden" name="messageId" value={m.id} />
-                            <Button
-                              size="sm"
-                              variant="flat"
-                              color="primary"
-                              type="submit"
-                            >
-                              恢复
-                            </Button>
-                          </Form>
-                          <Form
-                            method="post"
-                            onSubmit={(e) => {
-                              if (
-                                !window.confirm(
-                                  "确认彻底删除该条消息？彻底删除后管理员端也不显示，但数据库仍保留记录。"
-                                )
-                              ) {
-                                e.preventDefault();
-                              }
-                            }}
-                          >
-                            <input type="hidden" name="_intent" value="purgeMessage" />
-                            <input type="hidden" name="messageId" value={m.id} />
-                            <Button size="sm" variant="flat" color="danger" type="submit">
-                              彻底删除
-                            </Button>
-                          </Form>
-                        </>
-                      ) : (
-                        <Form
-                          method="post"
-                          onSubmit={(e) => {
-                            if (!window.confirm("确认删除该条消息？")) {
-                              e.preventDefault();
-                            }
-                          }}
-                        >
-                          <input type="hidden" name="_intent" value="deleteMessage" />
-                          <input type="hidden" name="messageId" value={m.id} />
-                          <Button size="sm" variant="light" color="danger" type="submit">
-                            删除
-                          </Button>
-                        </Form>
-                      )}
-                    </div>
-                  </div>
-
-                  {isMsgDeleted ? (
-                    <div className="text-xs text-danger">
-                      已删除：
-                      {m.deleted_at
-                        ? new Date(m.deleted_at).toLocaleString("zh-CN")
-                        : "-"}
-                      {deletedBy ? ` · 操作人：${deletedBy}` : ""}
-                    </div>
-                  ) : null}
-
-                  <div className="prose prose-sm max-w-none dark:prose-invert">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {m.body_markdown}
-                    </ReactMarkdown>
-                  </div>
-
-                  {attachmentsByMessage.get(m.id)?.length ? (
-                    <div className="text-sm text-default-600">
-                      附件：
-                      {attachmentsByMessage.get(m.id)!.map((a) => (
-                        <span key={a.id} className="ml-2">
-                          <a
-                            className="text-primary underline"
-                            href={`/attachments/${a.id}`}
-                          >
-                            {a.filename}
-                          </a>
-                          <span className="text-xs text-default-500">
-                            {" "}({Math.ceil(a.size_bytes / 1024)} KB)
-                          </span>
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                </CardBody>
-              </Card>
+                <MessageCard
+                  key={m.id}
+                  message={m}
+                  deletedByLabel={deletedByLabel}
+                  attachments={msgAttachments}
+                />
               );
             })}
           </div>

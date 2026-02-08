@@ -16,26 +16,20 @@ import { Providers } from "./ui/Providers";
 
 export async function loader({ request }: Route.LoaderArgs) {
   const { getSessionUser } = await import("./server/session");
+  const { getIsAdminForUid } = await import("./server/models/users.server");
   const user = await getSessionUser(request);
 
   if (!user) {
     return data({ user: null });
   }
 
-  // Fetch is_admin from database
-  const { getSupabaseAdminDb } = await import("./server/supabase.server");
-  const supabase = getSupabaseAdminDb();
-  const { data: userData } = await supabase
-    .from("users")
-    .select("is_admin")
-    .eq("uid", user.uid)
-    .maybeSingle();
+  const isAdmin = await getIsAdminForUid(user.uid);
 
   return data({
     user: {
       uid: user.uid,
       username: user.username,
-      isAdmin: userData?.is_admin ?? false,
+      isAdmin,
     },
   });
 }

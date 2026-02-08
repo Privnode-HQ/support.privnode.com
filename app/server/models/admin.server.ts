@@ -32,6 +32,21 @@ export async function listAllUsers(): Promise<AdminUserRow[]> {
   return (data ?? []) as any;
 }
 
+export type AdminUserBasicRow = Pick<
+  AdminUserRow,
+  "uid" | "username" | "display_name" | "is_admin"
+>;
+
+export async function listAllUsersBasic(): Promise<AdminUserBasicRow[]> {
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("users")
+    .select("uid,username,display_name,is_admin")
+    .order("created_at", { ascending: false });
+  if (error) throw new Error(`读取用户失败：${error.message}`);
+  return (data ?? []) as any;
+}
+
 export async function updateMyDisplayName(params: {
   uid: number;
   displayName: string;
@@ -79,10 +94,9 @@ export type AdminTicketListFilters = {
   sortDirection?: AdminTicketSortDirection;
 };
 
-export async function listAllTickets(
-  filters: AdminTicketListFilters = {}
+async function listAllTicketsLegacy(
+  filters: AdminTicketListFilters = {},
 ): Promise<AdminTicketListItem[]> {
-  ensureSmartSortCronStarted();
   const supabase = getSupabaseAdminDb();
 
   const sort: AdminTicketSort =
@@ -100,7 +114,7 @@ export async function listAllTickets(
   let query = supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,deleted_at,deleted_by_uid,updated_at,created_at"
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,deleted_at,deleted_by_uid,updated_at,created_at",
     )
     .is("purged_at", null);
 
@@ -118,14 +132,16 @@ export async function listAllTickets(
     new Set(
       [
         ...(filters.assignedToUids ?? []),
-        ...(typeof filters.assignedToUid === "number" ? [filters.assignedToUid] : []),
-      ].filter((uid): uid is number => Number.isFinite(uid))
-    )
+        ...(typeof filters.assignedToUid === "number"
+          ? [filters.assignedToUid]
+          : []),
+      ].filter((uid): uid is number => Number.isFinite(uid)),
+    ),
   );
 
   if (filters.unassigned && assignedToUids.length > 0) {
     query = query.or(
-      `assigned_to_uid.is.null,assigned_to_uid.in.(${assignedToUids.join(",")})`
+      `assigned_to_uid.is.null,assigned_to_uid.in.(${assignedToUids.join(",")})`,
     );
   } else if (filters.unassigned) {
     query = query.is("assigned_to_uid", null);
@@ -140,7 +156,9 @@ export async function listAllTickets(
   if (sort === "created_at") {
     query = query.order("created_at", { ascending });
   } else {
-    query = query.order("updated_at", { ascending: sort === "smart" ? false : ascending });
+    query = query.order("updated_at", {
+      ascending: sort === "smart" ? false : ascending,
+    });
   }
   query = query.order("id", { ascending: true });
 
@@ -168,14 +186,11 @@ export async function listAllTickets(
   }
 
   const lastNudgeAtMsByTicket = new Map<string, number>();
-  const nudgeCountByTicket = new Map<string, number>();
   const lastNudgeAtRawByTicket = new Map<string, string>();
   for (const row of nudgeRows) {
     const ticketId = (row as any).ticket_id as string;
     const createdAt = (row as any).created_at as string;
     if (!ticketId || !createdAt) continue;
-
-    nudgeCountByTicket.set(ticketId, (nudgeCountByTicket.get(ticketId) ?? 0) + 1);
 
     const ts = new Date(createdAt).getTime();
     if (!Number.isFinite(ts)) continue;
@@ -187,7 +202,7 @@ export async function listAllTickets(
   }
 
   const messageTicketIds = Array.from(
-    new Set(nudgeRows.map((r) => (r as any).ticket_id).filter(Boolean))
+    new Set(nudgeRows.map((r) => (r as any).ticket_id).filter(Boolean)),
   );
   const messageRows: any[] = [];
   for (const ids of chunkArray(messageTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
@@ -230,7 +245,8 @@ export async function listAllTickets(
 
     const smartUrgencyScore =
       t.status === "closed" ? null : score?.urgency_score ?? null;
-    const smartTimeScore = t.status === "closed" ? null : score?.time_score ?? null;
+    const smartTimeScore =
+      t.status === "closed" ? null : score?.time_score ?? null;
     const smartComputedAt =
       t.status === "closed" ? null : score?.computed_at ?? null;
 
@@ -247,6 +263,113 @@ export async function listAllTickets(
   if (sort !== "smart") return withNudgeInfo;
 
   const scored = withNudgeInfo.map((t) => {
+    const urgencyScore = t.smart_urgency_score ?? 0;
+    const updatedMs = new Date(t.updated_at).getTime();
+    const createdMs = new Date(t.created_at).getTime();
+    const fallbackTimeScore =
+      (Number.isFinite(updatedMs) ? updatedMs : 0) * 0.7 +
+      (Number.isFinite(createdMs) ? createdMs : 0) * 0.3;
+    const timeScore = t.smart_time_score ?? fallbackTimeScore;
+    return { t, urgencyScore, timeScore };
+  });
+
+  scored.sort((a, b) => {
+    if (a.urgencyScore !== b.urgencyScore) {
+      return ascending
+        ? a.urgencyScore - b.urgencyScore
+        : b.urgencyScore - a.urgencyScore;
+    }
+    if (a.timeScore !== b.timeScore) {
+      return ascending ? a.timeScore - b.timeScore : b.timeScore - a.timeScore;
+    }
+    return a.t.id.localeCompare(b.t.id);
+  });
+
+  return scored.map((s) => s.t);
+}
+
+export async function listAllTickets(
+  filters: AdminTicketListFilters = {},
+): Promise<AdminTicketListItem[]> {
+  ensureSmartSortCronStarted();
+  const supabase = getSupabaseAdminDb();
+
+  const sort: AdminTicketSort =
+    filters.sort === "created_at" ||
+    filters.sort === "updated_at" ||
+    filters.sort === "smart"
+      ? filters.sort
+      : "updated_at";
+  const sortDirection: AdminTicketSortDirection =
+    filters.sortDirection === "asc" || filters.sortDirection === "desc"
+      ? filters.sortDirection
+      : "desc";
+  const ascending = sortDirection === "asc";
+
+  let query = supabase
+    .from("admin_ticket_list")
+    .select(
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,deleted_at,deleted_by_uid,nudge_last_at,nudge_pending,smart_urgency_score,smart_time_score,smart_computed_at,updated_at,created_at",
+    );
+
+  const statuses =
+    filters.statuses && filters.statuses.length > 0
+      ? filters.statuses
+      : filters.status
+        ? [filters.status]
+        : [];
+  if (statuses.length > 0) {
+    query = query.in("status", statuses);
+  }
+
+  const assignedToUids = Array.from(
+    new Set(
+      [
+        ...(filters.assignedToUids ?? []),
+        ...(typeof filters.assignedToUid === "number"
+          ? [filters.assignedToUid]
+          : []),
+      ].filter((uid): uid is number => Number.isFinite(uid)),
+    ),
+  );
+
+  if (filters.unassigned && assignedToUids.length > 0) {
+    query = query.or(
+      `assigned_to_uid.is.null,assigned_to_uid.in.(${assignedToUids.join(",")})`,
+    );
+  } else if (filters.unassigned) {
+    query = query.is("assigned_to_uid", null);
+  } else if (assignedToUids.length > 0) {
+    query = query.in("assigned_to_uid", assignedToUids);
+  }
+
+  if (filters.query) {
+    query = query.ilike("subject", `%${filters.query}%`);
+  }
+
+  if (sort === "created_at") {
+    query = query.order("created_at", { ascending });
+  } else {
+    query = query.order("updated_at", {
+      ascending: sort === "smart" ? false : ascending,
+    });
+  }
+  query = query.order("id", { ascending: true });
+
+  const { data, error } = await query;
+  if (error) {
+    const code = (error as any)?.code as string | undefined;
+    if (code === "42P01") {
+      // DB migration may not be applied yet; fallback to the legacy multi-query implementation.
+      return listAllTicketsLegacy(filters);
+    }
+    throw new Error(`读取工单失败：${error.message}`);
+  }
+
+  const list = (data ?? []) as AdminTicketListItem[];
+  if (sort !== "smart") return list;
+
+  const scored = list.map((t) => {
     const urgencyScore = t.smart_urgency_score ?? 0;
     const updatedMs = new Date(t.updated_at).getTime();
     const createdMs = new Date(t.created_at).getTime();
@@ -1153,6 +1276,19 @@ export type AdminCategoryRow = {
   created_at: string;
   updated_at: string;
 };
+
+export type AdminCategoryBasicRow = Pick<AdminCategoryRow, "id" | "name" | "enabled">;
+
+export async function listAllCategoriesBasic(): Promise<AdminCategoryBasicRow[]> {
+  const supabase = getSupabaseAdminDb();
+  const { data, error } = await supabase
+    .from("ticket_categories")
+    .select("id,name,enabled")
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`读取分类失败：${error.message}`);
+  return (data ?? []) as any;
+}
 
 export async function listAllCategories(): Promise<AdminCategoryRow[]> {
   const supabase = getSupabaseAdminDb();

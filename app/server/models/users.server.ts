@@ -1,48 +1,76 @@
-import { getSupabaseAdminDbOptional } from "../supabase.server";
-import { env } from "../env";
+import { getSupabaseAdminDb, getSupabaseAdminDbOptional } from "../supabase.server";
 
-export async function ensureUserFromSso(params: { uid: number; username: string }) {
-  const supabase = getSupabaseAdminDbOptional();
-  if (!supabase) {
-    // Allow the app to run without Supabase during early development.
-    return;
-  }
+const IS_ADMIN_CACHE_TTL_MS = 30 * 1000;
 
-  const now = new Date().toISOString();
-  const { data: existing, error: selectError } = await supabase
-    .from("users")
-    .select("uid, display_name")
-    .eq("uid", params.uid)
-    .maybeSingle();
+type CacheEntry = {
+  value: boolean;
+  expiresAtMs: number;
+};
 
-  if (selectError) {
-    if (selectError.message.startsWith("Invalid schema:")) {
-      throw new Error(
-        `读取用户失败：${selectError.message}。请在 Supabase Dashboard → Settings → API → Schemas 中将 \`${env.supabaseDbSchema}\` 加入 Exposed schemas，然后在 SQL Editor 执行：notify pgrst, 'reload schema';`
-      );
+const isAdminCache = new Map<number, CacheEntry>();
+const isAdminInFlight = new Map<number, Promise<boolean>>();
+
+export async function getIsAdminForUid(uid: number): Promise<boolean> {
+  const safeUid = Number(uid);
+  if (!Number.isFinite(safeUid)) return false;
+
+  const now = Date.now();
+  const cached = isAdminCache.get(safeUid);
+  if (cached && cached.expiresAtMs > now) return cached.value;
+
+  const pending = isAdminInFlight.get(safeUid);
+  if (pending) return pending;
+
+  const p = (async () => {
+    const supabase = getSupabaseAdminDb();
+    const { data, error } = await supabase
+      .from("users")
+      .select("is_admin")
+      .eq("uid", safeUid)
+      .maybeSingle();
+    if (error) {
+      throw new Error(`读取权限失败：${error.message}`);
     }
-    if (selectError.message.includes("permission denied for schema")) {
-      throw new Error(
-        `读取用户失败：${selectError.message}。请在 Supabase SQL Editor 执行：grant usage on schema ${env.supabaseDbSchema} to service_role; grant all privileges on all tables in schema ${env.supabaseDbSchema} to service_role;`
-      );
-    }
-    throw new Error(`读取用户失败：${selectError.message}`);
-  }
 
-  if (!existing) {
-    const { error } = await supabase.from("users").insert({
-      uid: params.uid,
-      username: params.username,
-      display_name: params.username,
-      last_login_at: now,
+    const isAdmin = Boolean((data as any)?.is_admin);
+    isAdminCache.set(safeUid, {
+      value: isAdmin,
+      expiresAtMs: Date.now() + IS_ADMIN_CACHE_TTL_MS,
     });
-    if (error) throw new Error(`创建用户失败：${error.message}`);
-    return;
-  }
+    return isAdmin;
+  })();
 
-  const { error } = await supabase
-    .from("users")
-    .update({ username: params.username, last_login_at: now })
-    .eq("uid", params.uid);
-  if (error) throw new Error(`更新用户失败：${error.message}`);
+  isAdminInFlight.set(safeUid, p);
+  try {
+    return await p;
+  } finally {
+    isAdminInFlight.delete(safeUid);
+  }
+}
+
+export async function ensureUserFromSso(params: {
+  uid: number;
+  username: string;
+}): Promise<void> {
+  const supabase = getSupabaseAdminDbOptional();
+  if (!supabase) return;
+
+  const uid = Number(params.uid);
+  const username = String(params.username ?? "").trim();
+  if (!Number.isFinite(uid) || !username) return;
+
+  const { error } = await supabase.from("users").upsert(
+    {
+      uid,
+      username,
+      last_login_at: new Date().toISOString(),
+    },
+    {
+      onConflict: "uid",
+    },
+  );
+
+  if (error) {
+    throw new Error(`同步用户失败：${error.message}`);
+  }
 }

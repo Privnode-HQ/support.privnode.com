@@ -7,6 +7,7 @@ import {
   getAttachmentById,
 } from "../server/models/attachments.server";
 import { canUserAccessTicket } from "../server/models/tickets.server";
+import { getIsAdminForUid } from "../server/models/users.server";
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const user = await requireUser(request);
@@ -18,13 +19,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 
   const supabase = getSupabaseAdminDb();
-  const { data: u, error: uErr } = await supabase
-    .from("users")
-    .select("is_admin")
-    .eq("uid", user.uid)
-    .maybeSingle();
-  if (uErr) throw new Error(`读取权限失败：${uErr.message}`);
-  const isAdmin = Boolean((u as any)?.is_admin);
+  const isAdmin = await getIsAdminForUid(user.uid);
 
   if (!isAdmin) {
     const ok = await canUserAccessTicket(user.uid, attachment.ticket_id);

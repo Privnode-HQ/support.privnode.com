@@ -14,7 +14,7 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Form,
   NavLink,
@@ -34,9 +34,9 @@ import {
   type AdminTicketSortDirection,
   closeTicketsAsAdminBatch,
   createTicketAsAdmin,
-  listAllCategories,
+  listAllCategoriesBasic,
   listAllTickets,
-  listAllUsers,
+  listAllUsersBasic,
   mergeTicketsAsAdmin,
   softDeleteTicketsAsAdminBatch,
 } from "../server/models/admin.server";
@@ -51,6 +51,22 @@ const ALL_TICKET_STATUSES: TicketStatus[] = [
   "replied_by_customer",
   "closed",
 ];
+
+type AdminTicketsLoaderData = Route.ComponentProps["loaderData"];
+type TicketListItem = AdminTicketsLoaderData["tickets"][number];
+
+type TicketRowView = {
+  ticket: TicketListItem;
+  creator: string;
+  category: string;
+  assignee: string;
+  updatedAtText: string;
+  nudgeTitle: string | null;
+  isDeleted: boolean;
+  showSmartScore: boolean;
+  smartScoreText: string;
+  smartScoreTitle: string;
+};
 
 function asTicketStatus(value: string | null): TicketStatus | null {
   if (!value) return null;
@@ -108,16 +124,18 @@ function parseAssignedFilters(
   };
 }
 
+const COMPACT_DATETIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
 function formatCompactDateTime(ts: string) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+  return COMPACT_DATETIME_FORMATTER.format(d);
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -153,8 +171,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       sort,
       sortDirection: dir,
     }),
-    listAllCategories(),
-    listAllUsers(),
+    listAllCategoriesBasic(),
+    listAllUsersBasic(),
   ]);
 
   return data({
@@ -490,6 +508,84 @@ function FilterChipCheckbox(props: {
   );
 }
 
+const TicketListRow = memo(function TicketListRow(props: {
+  row: TicketRowView;
+  search: string;
+  isActive: boolean;
+  isSelected: boolean;
+  onToggleSelected: (ticketId: string, checked: boolean) => void;
+}) {
+  const t = props.row.ticket;
+  return (
+    <div
+      className={[
+        "border-b border-default-200 px-2 py-2 hover:bg-default-100",
+        props.isActive ? "bg-default-100" : "",
+        props.row.isDeleted ? "opacity-60" : "",
+      ].join(" ")}
+    >
+      <div className="flex items-start gap-2">
+        <div className="pt-0.5">
+          <Checkbox
+            aria-label={`选择工单 #${t.short_id}`}
+            isSelected={props.isSelected}
+            isDisabled={props.row.isDeleted}
+            onValueChange={(checked) => props.onToggleSelected(t.id, checked)}
+          />
+        </div>
+
+        <NavLink
+          to={{ pathname: t.id, search: props.search }}
+          className="flex-1 min-w-0"
+          aria-current={props.isActive ? "page" : undefined}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-xs text-default-500">
+                  #{t.short_id}
+                </span>
+                {t.nudge_pending && !props.row.isDeleted ? (
+                  <span
+                    title={props.row.nudgeTitle ?? "客户催单"}
+                    className="text-warning text-xs"
+                  >
+                    ★
+                  </span>
+                ) : null}
+                <div className="text-sm font-medium truncate">{t.subject}</div>
+              </div>
+              <div className="mt-0.5 text-xs text-default-500 truncate">
+                {props.row.creator} · {props.row.category} ·{" "}
+                {props.row.updatedAtText}
+              </div>
+            </div>
+            <div className="shrink-0 flex flex-col items-end gap-1">
+              {props.row.isDeleted ? (
+                <Chip color="danger" variant="flat" size="sm">
+                  已删除
+                </Chip>
+              ) : null}
+              <StatusChip status={t.status} />
+              <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
+                {props.row.assignee}
+              </div>
+              {props.row.showSmartScore ? (
+                <div
+                  className="text-[11px] text-default-500"
+                  title={props.row.smartScoreTitle}
+                >
+                  分: {props.row.smartScoreText}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </NavLink>
+      </div>
+    </div>
+  );
+});
+
 export default function AdminTickets({
   loaderData,
   actionData,
@@ -521,30 +617,99 @@ export default function AdminTickets({
   const [selectedTicketIds, setSelectedTicketIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const selectableTicketIds = loaderData.tickets
-    .filter((t) => !t.deleted_at)
-    .map((t) => t.id);
-  const selectedDeletableTicketIds = loaderData.tickets
-    .filter((t) => !t.deleted_at && selectedTicketIds.has(t.id))
-    .map((t) => t.id);
-  const selectedOpenTicketIds = loaderData.tickets
-    .filter(
-      (t) =>
-        !t.deleted_at && t.status !== "closed" && selectedTicketIds.has(t.id),
-    )
-    .map((t) => t.id);
-  const mergeableSourceTicketIds = selectedTicketId
-    ? selectedOpenTicketIds.filter((id) => id !== selectedTicketId)
-    : [];
-  const targetTicket = selectedTicketId
-    ? loaderData.tickets.find((t) => t.id === selectedTicketId) ?? null
-    : null;
-  const allSelectableSelected =
-    selectableTicketIds.length > 0 &&
-    selectableTicketIds.every((id) => selectedTicketIds.has(id));
-  const someSelectableSelected =
-    selectableTicketIds.some((id) => selectedTicketIds.has(id)) &&
-    !allSelectableSelected;
+  const onToggleSelected = useCallback((ticketId: string, checked: boolean) => {
+    setSelectedTicketIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(ticketId);
+      else next.delete(ticketId);
+      return next;
+    });
+  }, []);
+
+  const selectableTicketIds = useMemo(
+    () => loaderData.tickets.filter((t) => !t.deleted_at).map((t) => t.id),
+    [loaderData.tickets],
+  );
+  const selectedDeletableTicketIds = useMemo(
+    () =>
+      loaderData.tickets
+        .filter((t) => !t.deleted_at && selectedTicketIds.has(t.id))
+        .map((t) => t.id),
+    [loaderData.tickets, selectedTicketIds],
+  );
+  const selectedOpenTicketIds = useMemo(
+    () =>
+      loaderData.tickets
+        .filter(
+          (t) =>
+            !t.deleted_at &&
+            t.status !== "closed" &&
+            selectedTicketIds.has(t.id),
+        )
+        .map((t) => t.id),
+    [loaderData.tickets, selectedTicketIds],
+  );
+  const mergeableSourceTicketIds = useMemo(
+    () =>
+      selectedTicketId
+        ? selectedOpenTicketIds.filter((id) => id !== selectedTicketId)
+        : [],
+    [selectedOpenTicketIds, selectedTicketId],
+  );
+  const targetTicket = useMemo(
+    () =>
+      selectedTicketId
+        ? loaderData.tickets.find((t) => t.id === selectedTicketId) ?? null
+        : null,
+    [loaderData.tickets, selectedTicketId],
+  );
+  const allSelectableSelected = useMemo(
+    () =>
+      selectableTicketIds.length > 0 &&
+      selectableTicketIds.every((id) => selectedTicketIds.has(id)),
+    [selectableTicketIds, selectedTicketIds],
+  );
+  const someSelectableSelected = useMemo(
+    () =>
+      selectableTicketIds.some((id) => selectedTicketIds.has(id)) &&
+      !allSelectableSelected,
+    [allSelectableSelected, selectableTicketIds, selectedTicketIds],
+  );
+
+  const ticketRows = useMemo<TicketRowView[]>(() => {
+    return loaderData.tickets.map((t) => {
+      const creatorName =
+        userMap.get(t.creator_uid) ?? `uid:${t.creator_uid}`;
+      const creator = `${creatorName} (uid:${t.creator_uid})`;
+      const category = categoryMap.get(t.category_id) ?? t.category_id;
+      const assignee = t.assigned_to_uid
+        ? (userMap.get(t.assigned_to_uid) ?? `uid:${t.assigned_to_uid}`)
+        : "未分配";
+      const isDeleted = Boolean(t.deleted_at);
+      const showSmartScore = t.status !== "closed" && !isDeleted;
+      const smartScoreText =
+        typeof t.smart_urgency_score === "number"
+          ? t.smart_urgency_score.toFixed(2)
+          : "未计算";
+
+      return {
+        ticket: t,
+        creator,
+        category,
+        assignee,
+        updatedAtText: formatCompactDateTime(t.updated_at),
+        nudgeTitle: t.nudge_last_at
+          ? `客户催单：${formatCompactDateTime(t.nudge_last_at)}`
+          : null,
+        isDeleted,
+        showSmartScore,
+        smartScoreText,
+        smartScoreTitle: t.smart_computed_at
+          ? `智能分数计算时间：${formatCompactDateTime(t.smart_computed_at)}`
+          : "智能分数尚未计算",
+      };
+    });
+  }, [categoryMap, loaderData.tickets, userMap]);
 
   const batchReplyModal = useDisclosure();
   const batchCloseModal = useDisclosure();
@@ -581,9 +746,7 @@ export default function AdminTickets({
   }, [selectedTicketId]);
 
   useEffect(() => {
-    const selectable = new Set(
-      loaderData.tickets.filter((t) => !t.deleted_at).map((t) => t.id),
-    );
+    const selectable = new Set(selectableTicketIds);
     setSelectedTicketIds((prev) => {
       if (prev.size === 0) return prev;
       let changed = false;
@@ -594,7 +757,7 @@ export default function AdminTickets({
       }
       return changed ? next : prev;
     });
-  }, [loaderData.tickets]);
+  }, [selectableTicketIds]);
 
   const selectedStatuses = loaderData.filters.statuses ?? [];
   const selectedAssigned = loaderData.filters.assigned ?? [];
@@ -868,110 +1031,19 @@ export default function AdminTickets({
             <div className="p-3 text-sm text-default-500">暂无工单。</div>
           ) : (
             <div>
-              {loaderData.tickets.map((t) => {
-                const creatorName =
-                  userMap.get(t.creator_uid) ?? `uid:${t.creator_uid}`;
-                const creator = `${creatorName} (uid:${t.creator_uid})`;
-                const category =
-                  categoryMap.get(t.category_id) ?? t.category_id;
-                const assignee = t.assigned_to_uid
-                  ? (userMap.get(t.assigned_to_uid) ??
-                    `uid:${t.assigned_to_uid}`)
-                  : "未分配";
-                const isDeleted = Boolean(t.deleted_at);
-                const showSmartScore = t.status !== "closed" && !isDeleted;
-                const smartScoreText =
-                  typeof t.smart_urgency_score === "number"
-                    ? t.smart_urgency_score.toFixed(2)
-                    : "未计算";
-
-                const isClosed = t.status === "closed";
+              {ticketRows.map((row) => {
+                const t = row.ticket;
                 const isActive = selectedTicketId === t.id;
+                const isSelected = selectedTicketIds.has(t.id);
                 return (
-                  <div
+                  <TicketListRow
                     key={t.id}
-                    className={[
-                      "border-b border-default-200 px-2 py-2 hover:bg-default-100",
-                      isActive ? "bg-default-100" : "",
-                      isDeleted ? "opacity-60" : "",
-                    ].join(" ")}
-                  >
-                    <div className="flex items-start gap-2">
-                      <div className="pt-0.5">
-                        <Checkbox
-                          aria-label={`选择工单 #${t.short_id}`}
-                          isSelected={selectedTicketIds.has(t.id)}
-                          isDisabled={isDeleted}
-                          onValueChange={(checked) => {
-                            setSelectedTicketIds((prev) => {
-                              const next = new Set(prev);
-                              if (checked) next.add(t.id);
-                              else next.delete(t.id);
-                              return next;
-                            });
-                          }}
-                        />
-                      </div>
-
-                      <NavLink
-                        to={{ pathname: t.id, search: location.search }}
-                        className="flex-1 min-w-0"
-                        aria-current={isActive ? "page" : undefined}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5">
-                              <span className="font-mono text-xs text-default-500">
-                                #{t.short_id}
-                              </span>
-                              {t.nudge_pending && !isDeleted ? (
-                                <span
-                                  title={
-                                    t.nudge_last_at
-                                      ? `客户催单：${formatCompactDateTime(t.nudge_last_at)}`
-                                      : "客户催单"
-                                  }
-                                  className="text-warning text-xs"
-                                >
-                                  ★
-                                </span>
-                              ) : null}
-                              <div className="text-sm font-medium truncate">
-                                {t.subject}
-                              </div>
-                            </div>
-                            <div className="mt-0.5 text-xs text-default-500 truncate">
-                              {creator} · {category} ·{" "}
-                              {formatCompactDateTime(t.updated_at)}
-                            </div>
-                          </div>
-                          <div className="shrink-0 flex flex-col items-end gap-1">
-                            {isDeleted ? (
-                              <Chip color="danger" variant="flat" size="sm">
-                                已删除
-                              </Chip>
-                            ) : null}
-                            <StatusChip status={t.status} />
-                            <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
-                              {assignee}
-                            </div>
-                            {showSmartScore ? (
-                              <div
-                                className="text-[11px] text-default-500"
-                                title={
-                                  t.smart_computed_at
-                                    ? `智能分数计算时间：${formatCompactDateTime(t.smart_computed_at)}`
-                                    : "智能分数尚未计算"
-                                }
-                              >
-                                分: {smartScoreText}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-                      </NavLink>
-                    </div>
-                  </div>
+                    row={row}
+                    search={location.search}
+                    isActive={isActive}
+                    isSelected={isSelected}
+                    onToggleSelected={onToggleSelected}
+                  />
                 );
               })}
             </div>
@@ -982,7 +1054,12 @@ export default function AdminTickets({
         <section className="min-h-0 rounded-medium border border-default-200 overflow-hidden flex flex-col">
           <div ref={detailScrollRef} className="flex-1 min-h-0 overflow-auto">
             {selectedTicketId ? (
-              <Outlet />
+              <Outlet
+                context={{
+                  categories: loaderData.categories,
+                  users: loaderData.users,
+                }}
+              />
             ) : (
               <div className="h-full flex items-center justify-center p-6 text-sm text-default-500">
                 从左侧选择一个工单以查看详情与回复。
