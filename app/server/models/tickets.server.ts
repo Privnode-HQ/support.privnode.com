@@ -64,6 +64,9 @@ export type TicketMessage = {
   author_display_name: string | null;
   body_markdown: string;
   created_at: string;
+  deleted_at: string | null;
+  deleted_by_uid: number | null;
+  deleted_reason: string | null;
 };
 
 export async function getLatestTicketNudgeAt(ticketId: string): Promise<string | null> {
@@ -86,11 +89,16 @@ export async function createTicketNudge(params: {
 
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("id,creator_uid,status,created_at")
+    .select("id,creator_uid,status,created_at,deleted_at,purged_at")
     .eq("id", params.ticketId)
     .maybeSingle();
   if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
-  if (!t || (t as any).creator_uid !== params.uid) {
+  if (
+    !t ||
+    (t as any).creator_uid !== params.uid ||
+    (t as any).deleted_at ||
+    (t as any).purged_at
+  ) {
     throw new Error("工单不存在或无权限。");
   }
   if ((t as any).status === "closed") {
@@ -158,7 +166,9 @@ export async function getSmartQueuePositionForTicket(ticketId: string): Promise<
   const { data, error } = await supabase
     .from("tickets")
     .select("id,created_at,updated_at")
-    .in("status", OPEN_TICKET_STATUSES);
+    .in("status", OPEN_TICKET_STATUSES)
+    .is("deleted_at", null)
+    .is("purged_at", null);
   if (error) throw new Error(`读取智能队列失败：${error.message}`);
 
   const list = (data ?? []) as any[];
@@ -199,7 +209,9 @@ export async function listTicketsForUser(uid: number): Promise<TicketListItem[]>
     .select(
       "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
     )
-    .eq("creator_uid", uid);
+    .eq("creator_uid", uid)
+    .is("deleted_at", null)
+    .is("purged_at", null);
   if (cErr) throw new Error(`读取工单失败：${cErr.message}`);
 
   const { data: globalTickets, error: gErr } = await supabase
@@ -207,7 +219,9 @@ export async function listTicketsForUser(uid: number): Promise<TicketListItem[]>
     .select(
       "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
     )
-    .eq("is_global", true);
+    .eq("is_global", true)
+    .is("deleted_at", null)
+    .is("purged_at", null);
   if (gErr) throw new Error(`读取工单失败：${gErr.message}`);
 
   const { data: participantRows, error: pErr } = await supabase
@@ -227,7 +241,9 @@ export async function listTicketsForUser(uid: number): Promise<TicketListItem[]>
       .select(
         "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
       )
-      .in("id", ids);
+      .in("id", ids)
+      .is("deleted_at", null)
+      .is("purged_at", null);
     if (error) throw new Error(`读取参与工单失败：${error.message}`);
     participantTickets.push(...(data ?? []));
   }
@@ -327,12 +343,13 @@ export async function getTicketForUser(params: {
   const { data: t, error } = await supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,category_id,form_data,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_reason,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,category_id,form_data,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_reason,assigned_to_uid,closed_reason,deleted_at,purged_at,created_at,updated_at,closed_at"
     )
     .eq("id", params.ticketId)
     .maybeSingle();
   if (error) throw new Error(`读取工单失败：${error.message}`);
   if (!t) return null;
+  if ((t as any).deleted_at || (t as any).purged_at) return null;
 
   const creatorUid = Number((t as any).creator_uid);
   const isGlobal = Boolean((t as any).is_global);
@@ -365,13 +382,23 @@ export async function getTicketForUser(params: {
   } as any;
 }
 
-export async function listMessages(ticketId: string): Promise<TicketMessage[]> {
+export async function listMessages(
+  ticketId: string,
+  options: { includeDeleted?: boolean } = {},
+): Promise<TicketMessage[]> {
   const supabase = getSupabaseAdminDb();
-  const { data: msgs, error } = await supabase
+  let query = supabase
     .from("ticket_messages")
-    .select("id,actor,author_uid,author_display_name,body_markdown,created_at")
+    .select(
+      "id,actor,author_uid,author_display_name,body_markdown,created_at,deleted_at,deleted_by_uid,deleted_reason"
+    )
     .eq("ticket_id", ticketId)
+    .is("purged_at", null)
     .order("created_at", { ascending: true });
+  if (!options.includeDeleted) {
+    query = query.is("deleted_at", null);
+  }
+  const { data: msgs, error } = await query;
   if (error) throw new Error(`读取消息失败：${error.message}`);
   return (msgs ?? []) as any;
 }
@@ -387,11 +414,13 @@ export async function addCustomerReply(params: {
   // Ensure user can access ticket and isn't closed.
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("id,status,creator_uid,is_global")
+    .select("id,status,creator_uid,is_global,deleted_at,purged_at")
     .eq("id", params.ticketId)
     .maybeSingle();
   if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
-  if (!t) throw new Error("工单不存在或无权限。");
+  if (!t || (t as any).deleted_at || (t as any).purged_at) {
+    throw new Error("工单不存在或无权限。");
+  }
 
   const creatorUid = Number((t as any).creator_uid);
   const isGlobal = Boolean((t as any).is_global);
@@ -440,11 +469,13 @@ export async function closeTicket(params: {
 
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("creator_uid,status")
+    .select("creator_uid,status,deleted_at,purged_at")
     .eq("id", params.ticketId)
     .maybeSingle();
   if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
-  if (!t) throw new Error("工单不存在或无权限。");
+  if (!t || (t as any).deleted_at || (t as any).purged_at) {
+    throw new Error("工单不存在或无权限。");
+  }
   if ((t as any).status === "closed") return;
   if (Number((t as any).creator_uid) !== params.uid) {
     throw new Error("仅工单创建者可以关闭工单。");
@@ -499,6 +530,7 @@ export async function getTicketIdByShortId(
     .from("tickets")
     .select("id,creator_uid")
     .eq("short_id", shortId)
+    .is("purged_at", null)
     .maybeSingle();
   if (error) throw new Error(`通过 short_id 查找工单失败：${error.message}`);
   if (!data) return null;
@@ -512,10 +544,11 @@ export async function canUserAccessTicket(
   const supabase = getSupabaseAdminDb();
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("id,creator_uid,is_global")
+    .select("id,creator_uid,is_global,deleted_at,purged_at")
     .eq("id", ticketId)
     .maybeSingle();
   if (tErr || !t) return false;
+  if ((t as any).deleted_at || (t as any).purged_at) return false;
   if (Boolean((t as any).is_global)) return true;
   if (Number((t as any).creator_uid) === uid) return true;
 

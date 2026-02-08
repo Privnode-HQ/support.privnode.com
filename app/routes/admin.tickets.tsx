@@ -38,6 +38,7 @@ import {
   listAllTickets,
   listAllUsers,
   mergeTicketsAsAdmin,
+  softDeleteTicketsAsAdminBatch,
 } from "../server/models/admin.server";
 import { getSupabaseAdminDb } from "../server/supabase.server";
 import { type TicketStatus, ticketStatusLabel } from "../shared/tickets";
@@ -285,6 +286,38 @@ export async function action({ request }: Route.ActionArgs) {
     }
   }
 
+  if (intent === "batchDelete") {
+    const ticketIds = form
+      .getAll("ticketIds")
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean);
+    if (ticketIds.length === 0) {
+      return data(
+        { ok: false as const, error: "请先选择至少一个工单。" },
+        { status: 400 },
+      );
+    }
+
+    try {
+      const result = await softDeleteTicketsAsAdminBatch({
+        ticketIds,
+        deletedByUid: admin.uid,
+      });
+      if (result.deleted_ticket_ids.length === 0) {
+        return data(
+          { ok: false as const, error: "所选工单均已删除。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "操作失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
   if (intent === "createTicket") {
     const categoryId = String(form.get("categoryId") ?? "");
     const subject = String(form.get("subject") ?? "").trim();
@@ -370,6 +403,7 @@ export async function action({ request }: Route.ActionArgs) {
       .map((v) => String(v ?? "").trim())
       .filter(Boolean);
     const reason = String(form.get("reason") ?? "").trim();
+    const mergeMessages = String(form.get("mergeMessages") ?? "1") === "1";
 
     if (!targetTicketId) {
       return data(
@@ -390,6 +424,7 @@ export async function action({ request }: Route.ActionArgs) {
         sourceTicketIds,
         mergedByUid: admin.uid,
         mergedReason: reason,
+        mergeMessages,
       });
       if (result.merged_source_ticket_ids.length === 0) {
         return data(
@@ -487,10 +522,16 @@ export default function AdminTickets({
     () => new Set(),
   );
   const selectableTicketIds = loaderData.tickets
-    .filter((t) => t.status !== "closed")
+    .filter((t) => !t.deleted_at)
+    .map((t) => t.id);
+  const selectedDeletableTicketIds = loaderData.tickets
+    .filter((t) => !t.deleted_at && selectedTicketIds.has(t.id))
     .map((t) => t.id);
   const selectedOpenTicketIds = loaderData.tickets
-    .filter((t) => t.status !== "closed" && selectedTicketIds.has(t.id))
+    .filter(
+      (t) =>
+        !t.deleted_at && t.status !== "closed" && selectedTicketIds.has(t.id),
+    )
     .map((t) => t.id);
   const mergeableSourceTicketIds = selectedTicketId
     ? selectedOpenTicketIds.filter((id) => id !== selectedTicketId)
@@ -507,6 +548,7 @@ export default function AdminTickets({
 
   const batchReplyModal = useDisclosure();
   const batchCloseModal = useDisclosure();
+  const batchDeleteModal = useDisclosure();
   const createTicketModal = useDisclosure();
   const mergeTicketsModal = useDisclosure();
 
@@ -514,6 +556,7 @@ export default function AdminTickets({
   const [createParticipantKeys, setCreateParticipantKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [mergeMoveMessages, setMergeMoveMessages] = useState(true);
 
   const submitTimerRef = useRef<number | null>(null);
   useEffect(() => {
@@ -539,7 +582,7 @@ export default function AdminTickets({
 
   useEffect(() => {
     const selectable = new Set(
-      loaderData.tickets.filter((t) => t.status !== "closed").map((t) => t.id),
+      loaderData.tickets.filter((t) => !t.deleted_at).map((t) => t.id),
     );
     setSelectedTicketIds((prev) => {
       if (prev.size === 0) return prev;
@@ -644,9 +687,9 @@ export default function AdminTickets({
                   全选
                 </Checkbox>
                 <div className="text-xs text-default-500">
-                  已选择 {selectedOpenTicketIds.length}
+                  已选择 {selectedDeletableTicketIds.length}
                 </div>
-                {selectedOpenTicketIds.length > 0 ? (
+                {selectedDeletableTicketIds.length > 0 ? (
                   <Button
                     variant="light"
                     className="h-8 px-2 text-sm"
@@ -674,10 +717,14 @@ export default function AdminTickets({
                   isDisabled={
                     !selectedTicketId ||
                     !targetTicket ||
+                    Boolean(targetTicket.deleted_at) ||
                     targetTicket.status === "closed" ||
                     mergeableSourceTicketIds.length === 0
                   }
-                  onPress={mergeTicketsModal.onOpen}
+                  onPress={() => {
+                    setMergeMoveMessages(true);
+                    mergeTicketsModal.onOpen();
+                  }}
                 >
                   合并到当前
                 </Button>
@@ -689,6 +736,15 @@ export default function AdminTickets({
                   onPress={batchCloseModal.onOpen}
                 >
                   批量关闭
+                </Button>
+                <Button
+                  color="danger"
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                  isDisabled={selectedDeletableTicketIds.length === 0}
+                  onPress={batchDeleteModal.onOpen}
+                >
+                  批量删除
                 </Button>
               </div>
             </div>
@@ -822,7 +878,8 @@ export default function AdminTickets({
                   ? (userMap.get(t.assigned_to_uid) ??
                     `uid:${t.assigned_to_uid}`)
                   : "未分配";
-                const showSmartScore = t.status !== "closed";
+                const isDeleted = Boolean(t.deleted_at);
+                const showSmartScore = t.status !== "closed" && !isDeleted;
                 const smartScoreText =
                   typeof t.smart_urgency_score === "number"
                     ? t.smart_urgency_score.toFixed(2)
@@ -836,6 +893,7 @@ export default function AdminTickets({
                     className={[
                       "border-b border-default-200 px-2 py-2 hover:bg-default-100",
                       isActive ? "bg-default-100" : "",
+                      isDeleted ? "opacity-60" : "",
                     ].join(" ")}
                   >
                     <div className="flex items-start gap-2">
@@ -843,7 +901,7 @@ export default function AdminTickets({
                         <Checkbox
                           aria-label={`选择工单 #${t.short_id}`}
                           isSelected={selectedTicketIds.has(t.id)}
-                          isDisabled={isClosed}
+                          isDisabled={isDeleted}
                           onValueChange={(checked) => {
                             setSelectedTicketIds((prev) => {
                               const next = new Set(prev);
@@ -866,7 +924,7 @@ export default function AdminTickets({
                               <span className="font-mono text-xs text-default-500">
                                 #{t.short_id}
                               </span>
-                              {t.nudge_pending ? (
+                              {t.nudge_pending && !isDeleted ? (
                                 <span
                                   title={
                                     t.nudge_last_at
@@ -888,6 +946,11 @@ export default function AdminTickets({
                             </div>
                           </div>
                           <div className="shrink-0 flex flex-col items-end gap-1">
+                            {isDeleted ? (
+                              <Chip color="danger" variant="flat" size="sm">
+                                已删除
+                              </Chip>
+                            ) : null}
                             <StatusChip status={t.status} />
                             <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
                               {assignee}
@@ -1000,6 +1063,34 @@ export default function AdminTickets({
         </ModalContent>
       </Modal>
 
+      <Modal
+        isOpen={batchDeleteModal.isOpen}
+        onClose={batchDeleteModal.onClose}
+      >
+        <ModalContent>
+          <Form method="post" onSubmit={batchDeleteModal.onClose}>
+            <input type="hidden" name="_intent" value="batchDelete" />
+            {selectedDeletableTicketIds.map((id) => (
+              <input key={id} type="hidden" name="ticketIds" value={id} />
+            ))}
+            <ModalHeader>批量删除工单</ModalHeader>
+            <ModalBody>
+              <div className="text-sm text-default-600">
+                将删除 {selectedDeletableTicketIds.length} 个工单（软删除，客户侧不可见，管理员仍可查看）。
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={batchDeleteModal.onClose}>
+                取消
+              </Button>
+              <Button color="danger" type="submit">
+                确认删除
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
       <Modal isOpen={createTicketModal.isOpen} onClose={createTicketModal.onClose}>
         <ModalContent>
           <Form
@@ -1105,6 +1196,11 @@ export default function AdminTickets({
               name="targetTicketId"
               value={selectedTicketId ?? ""}
             />
+            <input
+              type="hidden"
+              name="mergeMessages"
+              value={mergeMoveMessages ? "1" : "0"}
+            />
             {mergeableSourceTicketIds.map((id) => (
               <input key={id} type="hidden" name="sourceTicketIds" value={id} />
             ))}
@@ -1123,6 +1219,12 @@ export default function AdminTickets({
               <div className="text-sm text-default-600">
                 将合并 {mergeableSourceTicketIds.length} 个工单到目标工单。
               </div>
+              <Checkbox
+                isSelected={mergeMoveMessages}
+                onValueChange={setMergeMoveMessages}
+              >
+                合并消息与附件（迁移到目标工单）
+              </Checkbox>
               <Textarea
                 name="reason"
                 label="合并原因（可选）"

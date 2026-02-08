@@ -9,6 +9,8 @@ export async function processTicketLinks(
   viewerUid: number | null,
   isAdmin: boolean = false
 ): Promise<string> {
+  const basePath = isAdmin ? "/admin/tickets" : "/tickets";
+
   // Match #followed by exactly 8 lowercase hex characters
   const shortIdPattern = /#([a-f0-9]{8})\b/gi;
   const matches = [...markdown.matchAll(shortIdPattern)];
@@ -47,7 +49,7 @@ export async function processTicketLinks(
   let result = markdown;
   for (const [shortId, ticketId] of accessibleTickets.entries()) {
     const pattern = new RegExp(`#${shortId}\\b`, 'gi');
-    result = result.replace(pattern, `[#${shortId}](/tickets/${ticketId})`);
+    result = result.replace(pattern, `[#${shortId}](${basePath}/${ticketId})`);
   }
 
   return result;

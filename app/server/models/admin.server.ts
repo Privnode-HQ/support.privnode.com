@@ -54,6 +54,8 @@ export type AdminTicketListItem = {
   merged_into_ticket_id: string | null;
   category_id: string;
   assigned_to_uid: number | null;
+  deleted_at: string | null;
+  deleted_by_uid: number | null;
   nudge_last_at: string | null;
   nudge_pending: boolean;
   smart_urgency_score: number | null;
@@ -98,8 +100,9 @@ export async function listAllTickets(
   let query = supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,updated_at,created_at"
-    );
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,deleted_at,deleted_by_uid,updated_at,created_at"
+    )
+    .is("purged_at", null);
 
   const statuses =
     filters.statuses && filters.statuses.length > 0
@@ -192,7 +195,9 @@ export async function listAllTickets(
       .from("ticket_messages")
       .select("ticket_id,actor,created_at")
       .in("ticket_id", ids)
-      .in("actor", ["staff", "anonymous"]);
+      .in("actor", ["staff", "anonymous"])
+      .is("deleted_at", null)
+      .is("purged_at", null);
     if (res.error) {
       throw new Error(`读取消息统计失败：${res.error.message}`);
     }
@@ -272,9 +277,10 @@ export async function getTicketById(ticketId: string) {
   const { data, error } = await supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_by_uid,merged_reason,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_by_uid,merged_reason,category_id,form_data,assigned_to_uid,closed_reason,deleted_at,deleted_by_uid,deleted_reason,purged_at,purged_by_uid,purged_reason,created_at,updated_at,closed_at"
     )
     .eq("id", ticketId)
+    .is("purged_at", null)
     .maybeSingle();
   if (error) throw new Error(`读取工单失败：${error.message}`);
   return data as any;
@@ -353,12 +359,16 @@ export async function mergeTicketsAsAdmin(params: {
   sourceTicketIds: string[];
   mergedByUid: number;
   mergedReason: string;
+  mergeMessages?: boolean;
 }): Promise<{
   merged_source_ticket_ids: string[];
   skipped_missing_ticket_ids: string[];
+  skipped_deleted_ticket_ids: string[];
   skipped_already_merged_ticket_ids: string[];
 }> {
   const supabase = getSupabaseAdminDb();
+
+  const mergeMessages = params.mergeMessages !== false;
 
   const targetTicketId = String(params.targetTicketId ?? "").trim();
   const sourceTicketIds = Array.from(
@@ -375,17 +385,26 @@ export async function mergeTicketsAsAdmin(params: {
     return {
       merged_source_ticket_ids: [],
       skipped_missing_ticket_ids: [],
+      skipped_deleted_ticket_ids: [],
       skipped_already_merged_ticket_ids: [],
     };
   }
 
   const { data: target, error: tErr } = await supabase
     .from("tickets")
-    .select("id,short_id,status,is_global,merged_into_ticket_id")
+    .select(
+      "id,short_id,status,is_global,merged_into_ticket_id,deleted_at,purged_at"
+    )
     .eq("id", targetTicketId)
     .maybeSingle();
   if (tErr) throw new Error(`读取目标工单失败：${tErr.message}`);
   if (!target) throw new Error("目标工单不存在。");
+  if ((target as any).deleted_at) {
+    throw new Error("目标工单已删除，无法作为主工单。");
+  }
+  if ((target as any).purged_at) {
+    throw new Error("目标工单已彻底删除，无法作为主工单。");
+  }
   if ((target as any).status === "closed") {
     throw new Error("目标工单已关闭，无法作为主工单。");
   }
@@ -397,7 +416,9 @@ export async function mergeTicketsAsAdmin(params: {
   for (const ids of chunkArray(sourceTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from("tickets")
-      .select("id,short_id,status,creator_uid,is_global,merged_into_ticket_id")
+      .select(
+        "id,short_id,status,creator_uid,is_global,merged_into_ticket_id,deleted_at,purged_at"
+      )
       .in("id", ids);
     if (error) throw new Error(`读取待合并工单失败：${error.message}`);
     sources.push(...(data ?? []));
@@ -411,6 +432,10 @@ export async function mergeTicketsAsAdmin(params: {
   }
 
   const skippedMissing = sourceTicketIds.filter((id) => !sourceById.has(id));
+  const skippedDeleted = sourceTicketIds.filter((id) => {
+    const row = sourceById.get(id);
+    return row && (Boolean((row as any).deleted_at) || Boolean((row as any).purged_at));
+  });
   const skippedAlreadyMerged = sourceTicketIds.filter((id) => {
     const row = sourceById.get(id);
     return row && (row as any).merged_into_ticket_id;
@@ -418,13 +443,19 @@ export async function mergeTicketsAsAdmin(params: {
 
   const mergeableSourceIds = sourceTicketIds.filter((id) => {
     const row = sourceById.get(id);
-    return row && !(row as any).merged_into_ticket_id;
+    return (
+      row &&
+      !(row as any).deleted_at &&
+      !(row as any).purged_at &&
+      !(row as any).merged_into_ticket_id
+    );
   });
 
   if (mergeableSourceIds.length === 0) {
     return {
       merged_source_ticket_ids: [],
       skipped_missing_ticket_ids: skippedMissing,
+      skipped_deleted_ticket_ids: skippedDeleted,
       skipped_already_merged_ticket_ids: skippedAlreadyMerged,
     };
   }
@@ -462,20 +493,22 @@ export async function mergeTicketsAsAdmin(params: {
     }
   }
 
-  // Move messages + attachments to target.
-  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
-    const { error } = await supabase
-      .from("ticket_messages")
-      .update({ ticket_id: targetTicketId })
-      .in("ticket_id", ids);
-    if (error) throw new Error(`合并消息失败：${error.message}`);
-  }
-  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
-    const { error } = await supabase
-      .from("ticket_attachments")
-      .update({ ticket_id: targetTicketId })
-      .in("ticket_id", ids);
-    if (error) throw new Error(`合并附件失败：${error.message}`);
+  if (mergeMessages) {
+    // Move messages + attachments to target.
+    for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+      const { error } = await supabase
+        .from("ticket_messages")
+        .update({ ticket_id: targetTicketId })
+        .in("ticket_id", ids);
+      if (error) throw new Error(`合并消息失败：${error.message}`);
+    }
+    for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+      const { error } = await supabase
+        .from("ticket_attachments")
+        .update({ ticket_id: targetTicketId })
+        .in("ticket_id", ids);
+      if (error) throw new Error(`合并附件失败：${error.message}`);
+    }
   }
 
   const shouldBeGlobal =
@@ -521,10 +554,15 @@ export async function mergeTicketsAsAdmin(params: {
   const mergedShortIds = mergeableSourceIds
     .map((id) => String((sourceById.get(id) as any)?.short_id ?? "").trim())
     .filter(Boolean);
+
+  const messageHintForTarget = mergeMessages
+    ? "消息与附件已迁移到本工单。"
+    : "消息与附件保留在原工单，未迁移。";
   const targetMsg =
     `已合并 ${mergeableSourceIds.length} 个工单` +
     (mergedShortIds.length > 0 ? `：${mergedShortIds.map((v) => `#${v}`).join("、")}` : "。") +
-    (reason ? `\n\n合并原因：${reason}` : "");
+    (reason ? `\n\n合并原因：${reason}` : "") +
+    `\n\n${messageHintForTarget}`;
 
   const { error: targetMsgErr } = await supabase.from("ticket_messages").insert({
     ticket_id: targetTicketId,
@@ -535,7 +573,10 @@ export async function mergeTicketsAsAdmin(params: {
 
   const sourceMsg =
     (targetShortId ? `该工单已合并到 #${targetShortId}。` : "该工单已合并到其它工单。") +
-    (reason ? `\n\n合并原因：${reason}` : "");
+    (reason ? `\n\n合并原因：${reason}` : "") +
+    (mergeMessages
+      ? "\n\n历史消息与附件已迁移到主工单。"
+      : "\n\n历史消息与附件保留在本工单，未迁移。");
 
   for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
     const { error } = await supabase.from("ticket_messages").insert(
@@ -551,6 +592,7 @@ export async function mergeTicketsAsAdmin(params: {
   return {
     merged_source_ticket_ids: mergeableSourceIds,
     skipped_missing_ticket_ids: skippedMissing,
+    skipped_deleted_ticket_ids: skippedDeleted,
     skipped_already_merged_ticket_ids: skippedAlreadyMerged,
   };
 }
@@ -561,6 +603,8 @@ export async function assignTicket(params: { ticketId: string; uid: number }) {
     .from("tickets")
     .update({ assigned_to_uid: params.uid, status: "assigned" })
     .eq("id", params.ticketId)
+    .is("deleted_at", null)
+    .is("purged_at", null)
     .neq("status", "closed")
     .select("id")
     .maybeSingle();
@@ -586,11 +630,13 @@ export async function addAdminReply(params: {
   const supabase = getSupabaseAdminDb();
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("status")
+    .select("status,deleted_at,purged_at")
     .eq("id", params.ticketId)
     .maybeSingle();
   if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
   if (!t) throw new Error("工单不存在。");
+  if ((t as any).deleted_at) throw new Error("工单已删除，无法回复。");
+  if ((t as any).purged_at) throw new Error("工单已彻底删除，无法回复。");
   if ((t as any).status === "closed") throw new Error("工单已关闭，无法回复。");
 
   const authorDisplayName =
@@ -613,7 +659,9 @@ export async function addAdminReply(params: {
   const { error: upErr } = await supabase
     .from("tickets")
     .update({ status: "replied_by_staff" })
-    .eq("id", params.ticketId);
+    .eq("id", params.ticketId)
+    .is("deleted_at", null)
+    .is("purged_at", null);
   if (upErr) throw new Error(`更新工单状态失败：${upErr.message}`);
 
   return { messageId: (msg as any).id };
@@ -628,6 +676,7 @@ export async function addAdminReplyBatch(params: {
 }): Promise<{
   replied_ticket_ids: string[];
   skipped_closed_ticket_ids: string[];
+  skipped_deleted_ticket_ids: string[];
   skipped_missing_ticket_ids: string[];
 }> {
   const supabase = getSupabaseAdminDb();
@@ -639,35 +688,44 @@ export async function addAdminReplyBatch(params: {
     return {
       replied_ticket_ids: [],
       skipped_closed_ticket_ids: [],
+      skipped_deleted_ticket_ids: [],
       skipped_missing_ticket_ids: [],
     };
   }
 
   const statusById = new Map<string, TicketStatus>();
+  const deletedAtById = new Map<string, string | null>();
+  const purgedAtById = new Map<string, string | null>();
   for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from("tickets")
-      .select("id,status")
+      .select("id,status,deleted_at,purged_at")
       .in("id", ids);
     if (error) throw new Error(`读取工单失败：${error.message}`);
     for (const row of data ?? []) {
       const id = String((row as any).id ?? "");
       const status = (row as any).status as TicketStatus | undefined;
       if (id && status) statusById.set(id, status);
+      if (id) deletedAtById.set(id, (row as any).deleted_at ?? null);
+      if (id) purgedAtById.set(id, (row as any).purged_at ?? null);
     }
   }
 
   const skippedMissing = ticketIds.filter((id) => !statusById.has(id));
   const skippedClosed = ticketIds.filter((id) => statusById.get(id) === "closed");
+  const skippedDeleted = ticketIds.filter(
+    (id) => Boolean(deletedAtById.get(id)) || Boolean(purgedAtById.get(id)),
+  );
   const openTicketIds = ticketIds.filter((id) => {
     const status = statusById.get(id);
-    return status && status !== "closed";
+    return status && status !== "closed" && !deletedAtById.get(id) && !purgedAtById.get(id);
   });
 
   if (openTicketIds.length === 0) {
     return {
       replied_ticket_ids: [],
       skipped_closed_ticket_ids: skippedClosed,
+      skipped_deleted_ticket_ids: skippedDeleted,
       skipped_missing_ticket_ids: skippedMissing,
     };
   }
@@ -694,6 +752,8 @@ export async function addAdminReplyBatch(params: {
       .from("tickets")
       .update({ status: "replied_by_staff" })
       .in("id", ids)
+      .is("deleted_at", null)
+      .is("purged_at", null)
       .neq("status", "closed");
     if (error) throw new Error(`更新工单状态失败：${error.message}`);
   }
@@ -701,6 +761,7 @@ export async function addAdminReplyBatch(params: {
   return {
     replied_ticket_ids: openTicketIds,
     skipped_closed_ticket_ids: skippedClosed,
+    skipped_deleted_ticket_ids: skippedDeleted,
     skipped_missing_ticket_ids: skippedMissing,
   };
 }
@@ -720,6 +781,8 @@ export async function closeTicketAsAdmin(params: {
       closed_at: new Date().toISOString(),
     })
     .eq("id", params.ticketId)
+    .is("deleted_at", null)
+    .is("purged_at", null)
     .neq("status", "closed")
     .select("id")
     .maybeSingle();
@@ -741,6 +804,7 @@ export async function closeTicketsAsAdminBatch(params: {
 }): Promise<{
   closed_ticket_ids: string[];
   skipped_closed_ticket_ids: string[];
+  skipped_deleted_ticket_ids: string[];
   skipped_missing_ticket_ids: string[];
 }> {
   const supabase = getSupabaseAdminDb();
@@ -752,35 +816,44 @@ export async function closeTicketsAsAdminBatch(params: {
     return {
       closed_ticket_ids: [],
       skipped_closed_ticket_ids: [],
+      skipped_deleted_ticket_ids: [],
       skipped_missing_ticket_ids: [],
     };
   }
 
   const statusById = new Map<string, TicketStatus>();
+  const deletedAtById = new Map<string, string | null>();
+  const purgedAtById = new Map<string, string | null>();
   for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from("tickets")
-      .select("id,status")
+      .select("id,status,deleted_at,purged_at")
       .in("id", ids);
     if (error) throw new Error(`读取工单失败：${error.message}`);
     for (const row of data ?? []) {
       const id = String((row as any).id ?? "");
       const status = (row as any).status as TicketStatus | undefined;
       if (id && status) statusById.set(id, status);
+      if (id) deletedAtById.set(id, (row as any).deleted_at ?? null);
+      if (id) purgedAtById.set(id, (row as any).purged_at ?? null);
     }
   }
 
   const skippedMissing = ticketIds.filter((id) => !statusById.has(id));
   const skippedClosed = ticketIds.filter((id) => statusById.get(id) === "closed");
+  const skippedDeleted = ticketIds.filter(
+    (id) => Boolean(deletedAtById.get(id)) || Boolean(purgedAtById.get(id)),
+  );
   const openTicketIds = ticketIds.filter((id) => {
     const status = statusById.get(id);
-    return status && status !== "closed";
+    return status && status !== "closed" && !deletedAtById.get(id) && !purgedAtById.get(id);
   });
 
   if (openTicketIds.length === 0) {
     return {
       closed_ticket_ids: [],
       skipped_closed_ticket_ids: skippedClosed,
+      skipped_deleted_ticket_ids: skippedDeleted,
       skipped_missing_ticket_ids: skippedMissing,
     };
   }
@@ -798,6 +871,8 @@ export async function closeTicketsAsAdminBatch(params: {
         closed_at: nowIso,
       })
       .in("id", ids)
+      .is("deleted_at", null)
+      .is("purged_at", null)
       .neq("status", "closed")
       .select("id");
     if (error) throw new Error(`关闭工单失败：${error.message}`);
@@ -824,8 +899,248 @@ export async function closeTicketsAsAdminBatch(params: {
   return {
     closed_ticket_ids: closedTicketIds,
     skipped_closed_ticket_ids: skippedClosed,
+    skipped_deleted_ticket_ids: skippedDeleted,
     skipped_missing_ticket_ids: skippedMissing,
   };
+}
+
+export async function softDeleteTicketsAsAdminBatch(params: {
+  ticketIds: string[];
+  deletedByUid: number;
+  reason?: string;
+}): Promise<{
+  deleted_ticket_ids: string[];
+  skipped_already_deleted_ticket_ids: string[];
+  skipped_missing_ticket_ids: string[];
+}> {
+  const supabase = getSupabaseAdminDb();
+
+  const ticketIds = Array.from(
+    new Set(params.ticketIds.map((v) => String(v ?? "").trim()).filter(Boolean)),
+  );
+  if (ticketIds.length === 0) {
+    return {
+      deleted_ticket_ids: [],
+      skipped_already_deleted_ticket_ids: [],
+      skipped_missing_ticket_ids: [],
+    };
+  }
+
+  const deletedAtById = new Map<string, string | null>();
+  for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("id,deleted_at")
+      .in("id", ids);
+    if (error) throw new Error(`读取工单失败：${error.message}`);
+    for (const row of data ?? []) {
+      const id = String((row as any).id ?? "");
+      if (!id) continue;
+      deletedAtById.set(id, (row as any).deleted_at ?? null);
+    }
+  }
+
+  const skippedMissing = ticketIds.filter((id) => !deletedAtById.has(id));
+  const skippedAlreadyDeleted = ticketIds.filter((id) =>
+    Boolean(deletedAtById.get(id)),
+  );
+  const deletableTicketIds = ticketIds.filter((id) => {
+    const deletedAt = deletedAtById.get(id);
+    return deletedAtById.has(id) && !deletedAt;
+  });
+
+  if (deletableTicketIds.length === 0) {
+    return {
+      deleted_ticket_ids: [],
+      skipped_already_deleted_ticket_ids: skippedAlreadyDeleted,
+      skipped_missing_ticket_ids: skippedMissing,
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const deletedTicketIds: string[] = [];
+  for (const ids of chunkArray(deletableTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .update({
+        deleted_at: nowIso,
+        deleted_by_uid: params.deletedByUid,
+        deleted_reason: params.reason?.trim() || null,
+      })
+      .in("id", ids)
+      .is("deleted_at", null)
+      .is("purged_at", null)
+      .select("id");
+    if (error) throw new Error(`删除工单失败：${error.message}`);
+    for (const row of data ?? []) {
+      const id = String((row as any).id ?? "");
+      if (id) deletedTicketIds.push(id);
+    }
+  }
+
+  return {
+    deleted_ticket_ids: deletedTicketIds,
+    skipped_already_deleted_ticket_ids: skippedAlreadyDeleted,
+    skipped_missing_ticket_ids: skippedMissing,
+  };
+}
+
+export async function softDeleteTicketAsAdmin(params: {
+  ticketId: string;
+  deletedByUid: number;
+  reason?: string;
+}): Promise<{ deleted: boolean }> {
+  const ticketId = String(params.ticketId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+
+  const res = await softDeleteTicketsAsAdminBatch({
+    ticketIds: [ticketId],
+    deletedByUid: params.deletedByUid,
+    reason: params.reason,
+  });
+
+  return { deleted: res.deleted_ticket_ids.includes(ticketId) };
+}
+
+export async function restoreTicketAsAdmin(params: {
+  ticketId: string;
+}): Promise<{ restored: boolean }> {
+  const supabase = getSupabaseAdminDb();
+  const ticketId = String(params.ticketId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+
+  const { data, error } = await supabase
+    .from("tickets")
+    .update({
+      deleted_at: null,
+      deleted_by_uid: null,
+      deleted_reason: null,
+    })
+    .eq("id", ticketId)
+    .is("purged_at", null)
+    .not("deleted_at", "is", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`恢复工单失败：${error.message}`);
+
+  return { restored: Boolean(data) };
+}
+
+export async function purgeTicketAsAdmin(params: {
+  ticketId: string;
+  purgedByUid: number;
+  reason?: string;
+}): Promise<{ purged: boolean }> {
+  const supabase = getSupabaseAdminDb();
+  const ticketId = String(params.ticketId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("tickets")
+    .update({
+      purged_at: nowIso,
+      purged_by_uid: params.purgedByUid,
+      purged_reason: params.reason?.trim() || null,
+    })
+    .eq("id", ticketId)
+    .is("purged_at", null)
+    .not("deleted_at", "is", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`彻底删除工单失败：${error.message}`);
+
+  return { purged: Boolean(data) };
+}
+
+export async function softDeleteTicketMessageAsAdmin(params: {
+  ticketId: string;
+  messageId: string;
+  deletedByUid: number;
+  reason?: string;
+}): Promise<{ deleted: boolean }> {
+  const supabase = getSupabaseAdminDb();
+  const ticketId = String(params.ticketId ?? "").trim();
+  const messageId = String(params.messageId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+  if (!messageId) throw new Error("缺少消息 ID。");
+
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("ticket_messages")
+    .update({
+      deleted_at: nowIso,
+      deleted_by_uid: params.deletedByUid,
+      deleted_reason: params.reason?.trim() || null,
+    })
+    .eq("id", messageId)
+    .eq("ticket_id", ticketId)
+    .is("purged_at", null)
+    .is("deleted_at", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`删除消息失败：${error.message}`);
+
+  return { deleted: Boolean(data) };
+}
+
+export async function restoreTicketMessageAsAdmin(params: {
+  ticketId: string;
+  messageId: string;
+}): Promise<{ restored: boolean }> {
+  const supabase = getSupabaseAdminDb();
+  const ticketId = String(params.ticketId ?? "").trim();
+  const messageId = String(params.messageId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+  if (!messageId) throw new Error("缺少消息 ID。");
+
+  const { data, error } = await supabase
+    .from("ticket_messages")
+    .update({
+      deleted_at: null,
+      deleted_by_uid: null,
+      deleted_reason: null,
+    })
+    .eq("id", messageId)
+    .eq("ticket_id", ticketId)
+    .is("purged_at", null)
+    .not("deleted_at", "is", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`恢复消息失败：${error.message}`);
+
+  return { restored: Boolean(data) };
+}
+
+export async function purgeTicketMessageAsAdmin(params: {
+  ticketId: string;
+  messageId: string;
+  purgedByUid: number;
+  reason?: string;
+}): Promise<{ purged: boolean }> {
+  const supabase = getSupabaseAdminDb();
+  const ticketId = String(params.ticketId ?? "").trim();
+  const messageId = String(params.messageId ?? "").trim();
+  if (!ticketId) throw new Error("缺少工单 ID。");
+  if (!messageId) throw new Error("缺少消息 ID。");
+
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("ticket_messages")
+    .update({
+      purged_at: nowIso,
+      purged_by_uid: params.purgedByUid,
+      purged_reason: params.reason?.trim() || null,
+    })
+    .eq("id", messageId)
+    .eq("ticket_id", ticketId)
+    .is("purged_at", null)
+    .not("deleted_at", "is", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`彻底删除消息失败：${error.message}`);
+
+  return { purged: Boolean(data) };
 }
 
 export type AdminCategoryRow = {

@@ -27,6 +27,12 @@ import {
   getTicketById,
   listAllCategories,
   listAllUsers,
+  purgeTicketAsAdmin,
+  purgeTicketMessageAsAdmin,
+  restoreTicketAsAdmin,
+  restoreTicketMessageAsAdmin,
+  softDeleteTicketAsAdmin,
+  softDeleteTicketMessageAsAdmin,
 } from "../server/models/admin.server";
 import { listMessages, listParticipantsForTicket } from "../server/models/tickets.server";
 import { ticketStatusLabel } from "../shared/tickets";
@@ -43,7 +49,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 
   const [ticket, messages, attachments, participants, categories, users] = await Promise.all([
     getTicketById(ticketId),
-    listMessages(ticketId),
+    listMessages(ticketId, { includeDeleted: true }),
     listAttachmentsForTicket(ticketId),
     listParticipantsForTicket(ticketId),
     listAllCategories(),
@@ -146,6 +152,151 @@ export async function action({ request, params }: Route.ActionArgs) {
     return redirect(returnTo);
   }
 
+  if (intent === "deleteTicket") {
+    try {
+      const res = await softDeleteTicketAsAdmin({
+        ticketId,
+        deletedByUid: admin.uid,
+      });
+      if (!res.deleted) {
+        return data(
+          { ok: false as const, error: "工单已删除。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "删除失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "restoreTicket") {
+    try {
+      const res = await restoreTicketAsAdmin({ ticketId });
+      if (!res.restored) {
+        return data(
+          { ok: false as const, error: "工单未处于已删除状态，或已彻底删除。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "恢复失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "purgeTicket") {
+    try {
+      const reason = String(form.get("reason") ?? "").trim();
+      const res = await purgeTicketAsAdmin({
+        ticketId,
+        purgedByUid: admin.uid,
+        reason,
+      });
+      if (!res.purged) {
+        return data(
+          { ok: false as const, error: "工单未处于已删除状态，或已彻底删除。" },
+          { status: 400 },
+        );
+      }
+      return redirect(`/admin/tickets${url.search}`);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "彻底删除失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "deleteMessage") {
+    const messageId = String(form.get("messageId") ?? "").trim();
+    if (!messageId) {
+      return data(
+        { ok: false as const, error: "缺少 messageId。" },
+        { status: 400 },
+      );
+    }
+    try {
+      const res = await softDeleteTicketMessageAsAdmin({
+        ticketId,
+        messageId,
+        deletedByUid: admin.uid,
+      });
+      if (!res.deleted) {
+        return data(
+          { ok: false as const, error: "消息已删除或不存在。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "删除消息失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "restoreMessage") {
+    const messageId = String(form.get("messageId") ?? "").trim();
+    if (!messageId) {
+      return data(
+        { ok: false as const, error: "缺少 messageId。" },
+        { status: 400 },
+      );
+    }
+    try {
+      const res = await restoreTicketMessageAsAdmin({ ticketId, messageId });
+      if (!res.restored) {
+        return data(
+          { ok: false as const, error: "消息未处于已删除状态，或不存在。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "恢复消息失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "purgeMessage") {
+    const messageId = String(form.get("messageId") ?? "").trim();
+    if (!messageId) {
+      return data(
+        { ok: false as const, error: "缺少 messageId。" },
+        { status: 400 },
+      );
+    }
+    try {
+      const res = await purgeTicketMessageAsAdmin({
+        ticketId,
+        messageId,
+        purgedByUid: admin.uid,
+      });
+      if (!res.purged) {
+        return data(
+          { ok: false as const, error: "消息未处于已删除状态，或已彻底删除/不存在。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "彻底删除消息失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
   return data(
     { ok: false as const, error: "未知操作。" },
     { status: 400 }
@@ -168,6 +319,9 @@ export default function AdminTicketDetail({
   const categoryMap = new Map(categories.map((c) => [c.id, c.name]));
   const userMap = new Map(users.map((u) => [u.uid, u.display_name ?? u.username]));
   const { isOpen, onOpen, onClose } = useDisclosure();
+  const deleteModal = useDisclosure();
+  const purgeModal = useDisclosure();
+  const isDeleted = Boolean(ticket.deleted_at);
 
   // Reverse messages to show newest first
   const reversedMessages = [...messages].reverse();
@@ -286,6 +440,17 @@ export default function AdminTicketDetail({
                 关闭原因：{ticket.closed_reason ?? "-"}
               </div>
             ) : null}
+            {isDeleted ? (
+              <div className="mt-0.5 text-xs text-danger truncate">
+                已删除：
+                {ticket.deleted_at
+                  ? new Date(ticket.deleted_at).toLocaleString("zh-CN")
+                  : "-"}
+                {ticket.deleted_by_uid
+                  ? ` · 操作人：${userMap.get(ticket.deleted_by_uid) ?? `uid:${ticket.deleted_by_uid}`} (uid:${ticket.deleted_by_uid})`
+                  : ""}
+              </div>
+            ) : null}
             {ticket.merged_into_ticket_id ? (
               <div className="mt-0.5 text-xs text-warning truncate">
                 该工单已合并到主工单：{" "}
@@ -300,10 +465,40 @@ export default function AdminTicketDetail({
           </div>
 
           <div className="shrink-0 flex items-center gap-2">
+            {isDeleted ? (
+              <Chip color="danger" variant="flat" size="sm">
+                已删除
+              </Chip>
+            ) : null}
             <Chip color={statusColor as any} variant="flat" size="sm">
               {ticketStatusLabel(ticket.status as any)}
             </Chip>
-            {ticket.status !== "closed" && ticket.assigned_to_uid !== loaderData.admin.uid ? (
+            {isDeleted ? (
+              <Form method="post">
+                <input type="hidden" name="_intent" value="restoreTicket" />
+                <Button
+                  color="primary"
+                  variant="flat"
+                  type="submit"
+                  className="h-8 px-3 text-sm"
+                >
+                  恢复
+                </Button>
+              </Form>
+            ) : null}
+            {isDeleted ? (
+              <Button
+                color="danger"
+                variant="flat"
+                onPress={purgeModal.onOpen}
+                className="h-8 px-3 text-sm"
+              >
+                彻底删除
+              </Button>
+            ) : null}
+            {ticket.status !== "closed" &&
+            !isDeleted &&
+            ticket.assigned_to_uid !== loaderData.admin.uid ? (
               <Form method="post">
                 <input type="hidden" name="_intent" value="assignToMe" />
                 <Button
@@ -316,7 +511,7 @@ export default function AdminTicketDetail({
                 </Button>
               </Form>
             ) : null}
-            {ticket.status !== "closed" && (
+            {ticket.status !== "closed" && !isDeleted ? (
               <Button
                 color="danger"
                 variant="flat"
@@ -325,7 +520,17 @@ export default function AdminTicketDetail({
               >
                 关闭
               </Button>
-            )}
+            ) : null}
+            {!isDeleted ? (
+              <Button
+                color="danger"
+                variant="light"
+                onPress={deleteModal.onOpen}
+                className="h-8 px-3 text-sm"
+              >
+                删除
+              </Button>
+            ) : null}
           </div>
         </div>
       </div>
@@ -378,17 +583,105 @@ export default function AdminTicketDetail({
           <p className="text-sm text-default-600">暂无消息。</p>
         ) : (
           <div className="space-y-2">
-            {reversedMessages.map((m) => (
-              <Card key={m.id} className="shadow-none border border-default-200">
+            {reversedMessages.map((m) => {
+              const isMsgDeleted = Boolean(m.deleted_at);
+              const deletedBy =
+                m.deleted_by_uid != null
+                  ? userMap.get(m.deleted_by_uid) ?? `uid:${m.deleted_by_uid}`
+                  : null;
+              return (
+              <Card
+                key={m.id}
+                className={[
+                  "shadow-none border border-default-200",
+                  isMsgDeleted ? "opacity-60" : "",
+                ].join(" ")}
+              >
                 <CardBody className="space-y-2 px-3 py-2">
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="text-sm font-medium">
-                      {ActorLabel(m.actor, m.author_display_name)}
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <div className="text-sm font-medium">
+                          {ActorLabel(m.actor, m.author_display_name)}
+                        </div>
+                        {isMsgDeleted ? (
+                          <Chip color="danger" variant="flat" size="sm">
+                            已删除
+                          </Chip>
+                        ) : null}
+                      </div>
+                      <div className="text-xs text-default-500">
+                        {new Date(m.created_at).toLocaleString("zh-CN")}
+                      </div>
                     </div>
-                    <div className="text-xs text-default-500">
-                      {new Date(m.created_at).toLocaleString("zh-CN")}
+
+                    <div className="shrink-0 flex items-center gap-2">
+                      {isMsgDeleted ? (
+                        <>
+                          <Form method="post">
+                            <input
+                              type="hidden"
+                              name="_intent"
+                              value="restoreMessage"
+                            />
+                            <input type="hidden" name="messageId" value={m.id} />
+                            <Button
+                              size="sm"
+                              variant="flat"
+                              color="primary"
+                              type="submit"
+                            >
+                              恢复
+                            </Button>
+                          </Form>
+                          <Form
+                            method="post"
+                            onSubmit={(e) => {
+                              if (
+                                !window.confirm(
+                                  "确认彻底删除该条消息？彻底删除后管理员端也不显示，但数据库仍保留记录。"
+                                )
+                              ) {
+                                e.preventDefault();
+                              }
+                            }}
+                          >
+                            <input type="hidden" name="_intent" value="purgeMessage" />
+                            <input type="hidden" name="messageId" value={m.id} />
+                            <Button size="sm" variant="flat" color="danger" type="submit">
+                              彻底删除
+                            </Button>
+                          </Form>
+                        </>
+                      ) : (
+                        <Form
+                          method="post"
+                          onSubmit={(e) => {
+                            if (!window.confirm("确认删除该条消息？")) {
+                              e.preventDefault();
+                            }
+                          }}
+                        >
+                          <input type="hidden" name="_intent" value="deleteMessage" />
+                          <input type="hidden" name="messageId" value={m.id} />
+                          <Button size="sm" variant="light" color="danger" type="submit">
+                            删除
+                          </Button>
+                        </Form>
+                      )}
                     </div>
                   </div>
+
+                  {isMsgDeleted ? (
+                    <div className="text-xs text-danger">
+                      已删除：
+                      {m.deleted_at
+                        ? new Date(m.deleted_at).toLocaleString("zh-CN")
+                        : "-"}
+                      {deletedBy ? ` · 操作人：${deletedBy}` : ""}
+                    </div>
+                  ) : null}
+
                   <div className="prose prose-sm max-w-none dark:prose-invert">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {m.body_markdown}
@@ -415,12 +708,13 @@ export default function AdminTicketDetail({
                   ) : null}
                 </CardBody>
               </Card>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
 
-      {ticket.status !== "closed" && <ReplyForm />}
+      {ticket.status !== "closed" && !isDeleted && <ReplyForm />}
 
       {/* Close ticket confirmation modal */}
       <Modal isOpen={isOpen} onClose={onClose}>
@@ -441,6 +735,55 @@ export default function AdminTicketDetail({
               </Button>
               <Button color="danger" type="submit">
                 确认关闭
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={deleteModal.isOpen} onClose={deleteModal.onClose}>
+        <ModalContent>
+          <Form method="post" onSubmit={deleteModal.onClose}>
+            <input type="hidden" name="_intent" value="deleteTicket" />
+            <ModalHeader>删除工单</ModalHeader>
+            <ModalBody>
+              <div className="text-sm text-default-600">
+                删除后客户侧不可见（软删除），管理员仍可查看。
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={deleteModal.onClose}>
+                取消
+              </Button>
+              <Button color="danger" type="submit">
+                确认删除
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={purgeModal.isOpen} onClose={purgeModal.onClose}>
+        <ModalContent>
+          <Form method="post" onSubmit={purgeModal.onClose}>
+            <input type="hidden" name="_intent" value="purgeTicket" />
+            <ModalHeader>彻底删除工单</ModalHeader>
+            <ModalBody className="space-y-2">
+              <div className="text-sm text-default-600">
+                彻底删除后，管理员端也不再显示该工单，但数据库仍保留记录。
+              </div>
+              <Input
+                name="reason"
+                label="删除原因（可选）"
+                placeholder="例如：误报 / 垃圾内容 / 重复导入"
+              />
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={purgeModal.onClose}>
+                取消
+              </Button>
+              <Button color="danger" type="submit">
+                确认彻底删除
               </Button>
             </ModalFooter>
           </Form>

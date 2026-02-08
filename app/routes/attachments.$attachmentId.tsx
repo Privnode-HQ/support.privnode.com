@@ -29,6 +29,22 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   if (!isAdmin) {
     const ok = await canUserAccessTicket(user.uid, attachment.ticket_id);
     if (!ok) throw new Response("Forbidden", { status: 403 });
+
+    if (attachment.message_id) {
+      const { data: msg, error: mErr } = await supabase
+        .from("ticket_messages")
+        .select("id,ticket_id,deleted_at,purged_at")
+        .eq("id", attachment.message_id)
+        .maybeSingle();
+      if (mErr) throw new Error(`读取消息失败：${mErr.message}`);
+      if (!msg) throw new Response("Forbidden", { status: 403 });
+      if (String((msg as any).ticket_id ?? "") !== attachment.ticket_id) {
+        throw new Response("Forbidden", { status: 403 });
+      }
+      if ((msg as any).deleted_at || (msg as any).purged_at) {
+        throw new Response("Forbidden", { status: 403 });
+      }
+    }
   }
 
   const signedUrl = await createAttachmentDownloadUrl({

@@ -70,7 +70,9 @@ export async function recomputeTicketSmartScores(): Promise<SmartSortRecomputeRe
     const { data: tickets, error: tErr } = await supabase
       .from("tickets")
       .select("id,creator_uid,status,created_at,updated_at")
-      .in("status", OPEN_TICKET_STATUSES);
+      .in("status", OPEN_TICKET_STATUSES)
+      .is("deleted_at", null)
+      .is("purged_at", null);
 
     if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
     const openTickets = (tickets ?? []) as any[];
@@ -116,7 +118,9 @@ export async function recomputeTicketSmartScores(): Promise<SmartSortRecomputeRe
         .from("ticket_messages")
         .select("ticket_id,actor")
         .in("ticket_id", ids)
-        .in("actor", ["customer", "staff", "anonymous"]);
+        .in("actor", ["customer", "staff", "anonymous"])
+        .is("deleted_at", null)
+        .is("purged_at", null);
       if (mErr) throw new Error(`读取消息统计失败：${mErr.message}`);
 
       for (const row of msgs ?? []) {
