@@ -21,7 +21,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 
   const user = await requireUser(request);
   const tickets = await listTicketsForUser(user.uid);
-  return data({ tickets });
+  return data({ me: { uid: user.uid }, tickets });
 }
 
 function StatusChip({ status }: { status: string }) {
@@ -44,13 +44,15 @@ function StatusChip({ status }: { status: string }) {
 }
 
 export default function Tickets({ loaderData }: Route.ComponentProps) {
-  const { tickets } = loaderData;
+  const { me, tickets } = loaderData;
 
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold">我的工单</h1>
-        <p className="text-default-600">这里展示你创建的全部工单。</p>
+        <p className="text-default-600">
+          这里展示与你相关的全部工单（你发起 / 被加入 / 全体工单）。
+        </p>
       </div>
 
       <Card>
@@ -60,6 +62,7 @@ export default function Tickets({ loaderData }: Route.ComponentProps) {
             <TableHeader>
               <TableColumn>工单ID</TableColumn>
               <TableColumn>标题</TableColumn>
+              <TableColumn>范围</TableColumn>
               <TableColumn>类别</TableColumn>
               <TableColumn>状态</TableColumn>
               <TableColumn>更新时间</TableColumn>
@@ -76,6 +79,19 @@ export default function Tickets({ loaderData }: Route.ComponentProps) {
                     <UiLink as={Link} to={`/tickets/${t.id}`} color="primary">
                       {t.subject}
                     </UiLink>
+                  </TableCell>
+                  <TableCell>
+                    {t.is_global ? (
+                      <Chip size="sm" variant="flat" color="secondary">
+                        全体
+                      </Chip>
+                    ) : t.creator_uid !== me.uid ? (
+                      <Chip size="sm" variant="flat">
+                        共同
+                      </Chip>
+                    ) : (
+                      <span className="text-default-500 text-sm">-</span>
+                    )}
                   </TableCell>
                   <TableCell>{t.category_name ?? "-"}</TableCell>
                   <TableCell>

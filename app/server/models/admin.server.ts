@@ -50,6 +50,8 @@ export type AdminTicketListItem = {
   subject: string;
   status: TicketStatus;
   creator_uid: number;
+  is_global: boolean;
+  merged_into_ticket_id: string | null;
   category_id: string;
   assigned_to_uid: number | null;
   nudge_last_at: string | null;
@@ -96,7 +98,7 @@ export async function listAllTickets(
   let query = supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,creator_uid,category_id,assigned_to_uid,updated_at,created_at"
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,category_id,assigned_to_uid,updated_at,created_at"
     );
 
   const statuses =
@@ -142,7 +144,10 @@ export async function listAllTickets(
   const { data, error } = await query;
   if (error) throw new Error(`读取工单失败：${error.message}`);
 
-  const list = (data ?? []) as Omit<AdminTicketListItem, "nudge_last_at" | "nudge_pending">[];
+  const list = (data ?? []) as Omit<
+    AdminTicketListItem,
+    "nudge_last_at" | "nudge_pending"
+  >[];
   if (list.length === 0) return [];
 
   const ticketIds = list.map((t) => t.id);
@@ -267,12 +272,287 @@ export async function getTicketById(ticketId: string) {
   const { data, error } = await supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,creator_uid,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_by_uid,merged_reason,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
     )
     .eq("id", ticketId)
     .maybeSingle();
   if (error) throw new Error(`读取工单失败：${error.message}`);
   return data as any;
+}
+
+export async function createTicketAsAdmin(params: {
+  creatorUid: number;
+  creatorDisplayName: string;
+  categoryId: string;
+  subject: string;
+  formData: any;
+  bodyMarkdown: string;
+  participantUids: number[];
+  isGlobal: boolean;
+}): Promise<{ id: string; messageId: string }> {
+  const supabase = getSupabaseAdminDb();
+
+  const participantUids = Array.from(
+    new Set(
+      (params.participantUids ?? [])
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v)),
+    ),
+  );
+
+  if (!params.isGlobal && participantUids.length === 0) {
+    throw new Error("请选择至少一个用户，或勾选“所有用户”。");
+  }
+
+  const { data: ticket, error } = await supabase
+    .from("tickets")
+    .insert({
+      creator_uid: params.creatorUid,
+      category_id: params.categoryId,
+      subject: params.subject,
+      form_data: params.formData ?? {},
+      status: "replied_by_staff",
+      is_global: Boolean(params.isGlobal),
+    })
+    .select("id")
+    .single();
+
+  if (error) throw new Error(`创建工单失败：${error.message}`);
+  const ticketId = (ticket as any).id as string;
+
+  if (!params.isGlobal) {
+    for (const uids of chunkArray(participantUids, POSTGREST_IN_CHUNK_SIZE)) {
+      const { error: pErr } = await supabase
+        .from("ticket_participants")
+        .upsert(
+          uids.map((uid) => ({ ticket_id: ticketId, uid })),
+          { onConflict: "ticket_id,uid", ignoreDuplicates: true },
+        );
+      if (pErr) throw new Error(`写入参与用户失败：${pErr.message}`);
+    }
+  }
+
+  const { data: msg, error: msgErr } = await supabase
+    .from("ticket_messages")
+    .insert({
+      ticket_id: ticketId,
+      actor: "staff",
+      author_uid: params.creatorUid,
+      author_display_name: params.creatorDisplayName,
+      body_markdown: params.bodyMarkdown,
+    })
+    .select("id")
+    .single();
+  if (msgErr) throw new Error(`创建工单首条消息失败：${msgErr.message}`);
+
+  return { id: ticketId, messageId: (msg as any).id as string };
+}
+
+export async function mergeTicketsAsAdmin(params: {
+  targetTicketId: string;
+  sourceTicketIds: string[];
+  mergedByUid: number;
+  mergedReason: string;
+}): Promise<{
+  merged_source_ticket_ids: string[];
+  skipped_missing_ticket_ids: string[];
+  skipped_already_merged_ticket_ids: string[];
+}> {
+  const supabase = getSupabaseAdminDb();
+
+  const targetTicketId = String(params.targetTicketId ?? "").trim();
+  const sourceTicketIds = Array.from(
+    new Set(
+      (params.sourceTicketIds ?? [])
+        .map((v) => String(v ?? "").trim())
+        .filter(Boolean)
+        .filter((id) => id !== targetTicketId),
+    ),
+  );
+
+  if (!targetTicketId) throw new Error("缺少目标工单。");
+  if (sourceTicketIds.length === 0) {
+    return {
+      merged_source_ticket_ids: [],
+      skipped_missing_ticket_ids: [],
+      skipped_already_merged_ticket_ids: [],
+    };
+  }
+
+  const { data: target, error: tErr } = await supabase
+    .from("tickets")
+    .select("id,short_id,status,is_global,merged_into_ticket_id")
+    .eq("id", targetTicketId)
+    .maybeSingle();
+  if (tErr) throw new Error(`读取目标工单失败：${tErr.message}`);
+  if (!target) throw new Error("目标工单不存在。");
+  if ((target as any).status === "closed") {
+    throw new Error("目标工单已关闭，无法作为主工单。");
+  }
+  if ((target as any).merged_into_ticket_id) {
+    throw new Error("目标工单已被合并到其它工单，无法作为主工单。");
+  }
+
+  const sources: any[] = [];
+  for (const ids of chunkArray(sourceTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("id,short_id,status,creator_uid,is_global,merged_into_ticket_id")
+      .in("id", ids);
+    if (error) throw new Error(`读取待合并工单失败：${error.message}`);
+    sources.push(...(data ?? []));
+  }
+
+  const sourceById = new Map<string, any>();
+  for (const s of sources) {
+    const id = String((s as any).id ?? "");
+    if (!id) continue;
+    sourceById.set(id, s);
+  }
+
+  const skippedMissing = sourceTicketIds.filter((id) => !sourceById.has(id));
+  const skippedAlreadyMerged = sourceTicketIds.filter((id) => {
+    const row = sourceById.get(id);
+    return row && (row as any).merged_into_ticket_id;
+  });
+
+  const mergeableSourceIds = sourceTicketIds.filter((id) => {
+    const row = sourceById.get(id);
+    return row && !(row as any).merged_into_ticket_id;
+  });
+
+  if (mergeableSourceIds.length === 0) {
+    return {
+      merged_source_ticket_ids: [],
+      skipped_missing_ticket_ids: skippedMissing,
+      skipped_already_merged_ticket_ids: skippedAlreadyMerged,
+    };
+  }
+
+  // Collect participant uids from sources: creator_uid + ticket_participants.
+  const participantUidSet = new Set<number>();
+  for (const id of mergeableSourceIds) {
+    const s = sourceById.get(id);
+    const creatorUid = Number((s as any)?.creator_uid);
+    if (Number.isFinite(creatorUid)) participantUidSet.add(creatorUid);
+  }
+
+  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("ticket_participants")
+      .select("uid")
+      .in("ticket_id", ids);
+    if (error) throw new Error(`读取参与用户失败：${error.message}`);
+    for (const row of data ?? []) {
+      const uid = Number((row as any).uid);
+      if (Number.isFinite(uid)) participantUidSet.add(uid);
+    }
+  }
+
+  const participantUids = Array.from(participantUidSet);
+  if (participantUids.length > 0) {
+    for (const uids of chunkArray(participantUids, POSTGREST_IN_CHUNK_SIZE)) {
+      const { error } = await supabase
+        .from("ticket_participants")
+        .upsert(
+          uids.map((uid) => ({ ticket_id: targetTicketId, uid })),
+          { onConflict: "ticket_id,uid", ignoreDuplicates: true },
+        );
+      if (error) throw new Error(`写入参与用户失败：${error.message}`);
+    }
+  }
+
+  // Move messages + attachments to target.
+  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase
+      .from("ticket_messages")
+      .update({ ticket_id: targetTicketId })
+      .in("ticket_id", ids);
+    if (error) throw new Error(`合并消息失败：${error.message}`);
+  }
+  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase
+      .from("ticket_attachments")
+      .update({ ticket_id: targetTicketId })
+      .in("ticket_id", ids);
+    if (error) throw new Error(`合并附件失败：${error.message}`);
+  }
+
+  const shouldBeGlobal =
+    Boolean((target as any).is_global) ||
+    mergeableSourceIds.some((id) => Boolean((sourceById.get(id) as any)?.is_global));
+
+  // Bump target updated_at (+ optionally global flag).
+  {
+    const { error } = await supabase
+      .from("tickets")
+      .update({
+        is_global: shouldBeGlobal,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", targetTicketId);
+    if (error) throw new Error(`更新目标工单失败：${error.message}`);
+  }
+
+  const nowIso = new Date().toISOString();
+  const targetShortId = String((target as any).short_id ?? "").trim();
+  const reason = params.mergedReason.trim();
+  const closeReason =
+    reason || (targetShortId ? `已合并到 #${targetShortId}` : "已合并到其它工单");
+
+  // Close and mark merged for sources.
+  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase
+      .from("tickets")
+      .update({
+        status: "closed",
+        closed_reason: closeReason,
+        closed_at: nowIso,
+        merged_into_ticket_id: targetTicketId,
+        merged_at: nowIso,
+        merged_by_uid: params.mergedByUid,
+        merged_reason: reason || null,
+      })
+      .in("id", ids);
+    if (error) throw new Error(`更新被合并工单失败：${error.message}`);
+  }
+
+  // System messages: keep sources with a redirect note; add a summary to target.
+  const mergedShortIds = mergeableSourceIds
+    .map((id) => String((sourceById.get(id) as any)?.short_id ?? "").trim())
+    .filter(Boolean);
+  const targetMsg =
+    `已合并 ${mergeableSourceIds.length} 个工单` +
+    (mergedShortIds.length > 0 ? `：${mergedShortIds.map((v) => `#${v}`).join("、")}` : "。") +
+    (reason ? `\n\n合并原因：${reason}` : "");
+
+  const { error: targetMsgErr } = await supabase.from("ticket_messages").insert({
+    ticket_id: targetTicketId,
+    actor: "system",
+    body_markdown: targetMsg,
+  });
+  if (targetMsgErr) throw new Error(`创建系统消息失败：${targetMsgErr.message}`);
+
+  const sourceMsg =
+    (targetShortId ? `该工单已合并到 #${targetShortId}。` : "该工单已合并到其它工单。") +
+    (reason ? `\n\n合并原因：${reason}` : "");
+
+  for (const ids of chunkArray(mergeableSourceIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase.from("ticket_messages").insert(
+      ids.map((ticketId) => ({
+        ticket_id: ticketId,
+        actor: "system",
+        body_markdown: sourceMsg,
+      })),
+    );
+    if (error) throw new Error(`创建系统消息失败：${error.message}`);
+  }
+
+  return {
+    merged_source_ticket_ids: mergeableSourceIds,
+    skipped_missing_ticket_ids: skippedMissing,
+    skipped_already_merged_ticket_ids: skippedAlreadyMerged,
+  };
 }
 
 export async function assignTicket(params: { ticketId: string; uid: number }) {
@@ -339,6 +619,92 @@ export async function addAdminReply(params: {
   return { messageId: (msg as any).id };
 }
 
+export async function addAdminReplyBatch(params: {
+  ticketIds: string[];
+  actor: "staff" | "anonymous" | "system";
+  authorUid: number;
+  authorDisplayName: string;
+  bodyMarkdown: string;
+}): Promise<{
+  replied_ticket_ids: string[];
+  skipped_closed_ticket_ids: string[];
+  skipped_missing_ticket_ids: string[];
+}> {
+  const supabase = getSupabaseAdminDb();
+
+  const ticketIds = Array.from(
+    new Set(params.ticketIds.map((v) => String(v ?? "").trim()).filter(Boolean)),
+  );
+  if (ticketIds.length === 0) {
+    return {
+      replied_ticket_ids: [],
+      skipped_closed_ticket_ids: [],
+      skipped_missing_ticket_ids: [],
+    };
+  }
+
+  const statusById = new Map<string, TicketStatus>();
+  for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("id,status")
+      .in("id", ids);
+    if (error) throw new Error(`读取工单失败：${error.message}`);
+    for (const row of data ?? []) {
+      const id = String((row as any).id ?? "");
+      const status = (row as any).status as TicketStatus | undefined;
+      if (id && status) statusById.set(id, status);
+    }
+  }
+
+  const skippedMissing = ticketIds.filter((id) => !statusById.has(id));
+  const skippedClosed = ticketIds.filter((id) => statusById.get(id) === "closed");
+  const openTicketIds = ticketIds.filter((id) => {
+    const status = statusById.get(id);
+    return status && status !== "closed";
+  });
+
+  if (openTicketIds.length === 0) {
+    return {
+      replied_ticket_ids: [],
+      skipped_closed_ticket_ids: skippedClosed,
+      skipped_missing_ticket_ids: skippedMissing,
+    };
+  }
+
+  const authorDisplayName =
+    params.actor === "anonymous" ? null : params.authorDisplayName;
+  const authorUid = params.actor === "system" ? null : params.authorUid;
+
+  for (const ids of chunkArray(openTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase.from("ticket_messages").insert(
+      ids.map((ticketId) => ({
+        ticket_id: ticketId,
+        actor: params.actor,
+        author_uid: authorUid,
+        author_display_name: authorDisplayName,
+        body_markdown: params.bodyMarkdown,
+      })),
+    );
+    if (error) throw new Error(`发送回复失败：${error.message}`);
+  }
+
+  for (const ids of chunkArray(openTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { error } = await supabase
+      .from("tickets")
+      .update({ status: "replied_by_staff" })
+      .in("id", ids)
+      .neq("status", "closed");
+    if (error) throw new Error(`更新工单状态失败：${error.message}`);
+  }
+
+  return {
+    replied_ticket_ids: openTicketIds,
+    skipped_closed_ticket_ids: skippedClosed,
+    skipped_missing_ticket_ids: skippedMissing,
+  };
+}
+
 export async function closeTicketAsAdmin(params: {
   ticketId: string;
   reason: string;
@@ -367,6 +733,99 @@ export async function closeTicketAsAdmin(params: {
     body_markdown: `工作人员关闭了工单（原因：${reason}）。`,
   });
   if (msgErr) throw new Error(`创建系统消息失败：${msgErr.message}`);
+}
+
+export async function closeTicketsAsAdminBatch(params: {
+  ticketIds: string[];
+  reason: string;
+}): Promise<{
+  closed_ticket_ids: string[];
+  skipped_closed_ticket_ids: string[];
+  skipped_missing_ticket_ids: string[];
+}> {
+  const supabase = getSupabaseAdminDb();
+
+  const ticketIds = Array.from(
+    new Set(params.ticketIds.map((v) => String(v ?? "").trim()).filter(Boolean)),
+  );
+  if (ticketIds.length === 0) {
+    return {
+      closed_ticket_ids: [],
+      skipped_closed_ticket_ids: [],
+      skipped_missing_ticket_ids: [],
+    };
+  }
+
+  const statusById = new Map<string, TicketStatus>();
+  for (const ids of chunkArray(ticketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("id,status")
+      .in("id", ids);
+    if (error) throw new Error(`读取工单失败：${error.message}`);
+    for (const row of data ?? []) {
+      const id = String((row as any).id ?? "");
+      const status = (row as any).status as TicketStatus | undefined;
+      if (id && status) statusById.set(id, status);
+    }
+  }
+
+  const skippedMissing = ticketIds.filter((id) => !statusById.has(id));
+  const skippedClosed = ticketIds.filter((id) => statusById.get(id) === "closed");
+  const openTicketIds = ticketIds.filter((id) => {
+    const status = statusById.get(id);
+    return status && status !== "closed";
+  });
+
+  if (openTicketIds.length === 0) {
+    return {
+      closed_ticket_ids: [],
+      skipped_closed_ticket_ids: skippedClosed,
+      skipped_missing_ticket_ids: skippedMissing,
+    };
+  }
+
+  const reason = params.reason.trim() || "已完成";
+  const nowIso = new Date().toISOString();
+
+  const closedTicketIds: string[] = [];
+  for (const ids of chunkArray(openTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .update({
+        status: "closed",
+        closed_reason: reason,
+        closed_at: nowIso,
+      })
+      .in("id", ids)
+      .neq("status", "closed")
+      .select("id");
+    if (error) throw new Error(`关闭工单失败：${error.message}`);
+
+    for (const row of data ?? []) {
+      const id = String((row as any).id ?? "");
+      if (id) closedTicketIds.push(id);
+    }
+  }
+
+  if (closedTicketIds.length > 0) {
+    for (const ids of chunkArray(closedTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+      const { error } = await supabase.from("ticket_messages").insert(
+        ids.map((ticketId) => ({
+          ticket_id: ticketId,
+          actor: "system",
+          body_markdown: `工作人员关闭了工单（原因：${reason}）。`,
+        })),
+      );
+      if (error) throw new Error(`创建系统消息失败：${error.message}`);
+    }
+  }
+
+  return {
+    closed_ticket_ids: closedTicketIds,
+    skipped_closed_ticket_ids: skippedClosed,
+    skipped_missing_ticket_ids: skippedMissing,
+  };
 }
 
 export type AdminCategoryRow = {

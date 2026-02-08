@@ -1,6 +1,20 @@
 import type { Route } from "./+types/admin.tickets";
-import { Chip, Button } from "@heroui/react";
-import { useEffect, useRef } from "react";
+import {
+  Button,
+  Checkbox,
+  Chip,
+  Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  Select,
+  SelectItem,
+  Textarea,
+  useDisclosure,
+} from "@heroui/react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Form,
   NavLink,
@@ -15,13 +29,19 @@ import {
 import { requireAdmin } from "../server/admin";
 import { recomputeTicketSmartScores } from "../server/models/smart-sort.server";
 import {
+  addAdminReplyBatch,
   type AdminTicketSort,
   type AdminTicketSortDirection,
+  closeTicketsAsAdminBatch,
+  createTicketAsAdmin,
   listAllCategories,
   listAllTickets,
   listAllUsers,
+  mergeTicketsAsAdmin,
 } from "../server/models/admin.server";
+import { getSupabaseAdminDb } from "../server/supabase.server";
 import { type TicketStatus, ticketStatusLabel } from "../shared/tickets";
+import { uploadAttachments } from "../server/models/attachments.server";
 
 const ALL_TICKET_STATUSES: TicketStatus[] = [
   "pending_assign",
@@ -152,7 +172,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export async function action({ request }: Route.ActionArgs) {
-  await requireAdmin(request);
+  const admin = await requireAdmin(request);
   const url = new URL(request.url);
   const returnTo = `${url.pathname}${url.search}`;
   const form = await request.formData();
@@ -169,6 +189,219 @@ export async function action({ request }: Route.ActionArgs) {
           error: e instanceof Error ? e.message : "计算失败。",
         },
         { status: 500 }
+      );
+    }
+  }
+
+  if (intent === "batchReply") {
+    const ticketIds = form
+      .getAll("ticketIds")
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean);
+    if (ticketIds.length === 0) {
+      return data(
+        { ok: false as const, error: "请先选择至少一个未关闭的工单。" },
+        { status: 400 },
+      );
+    }
+
+    const actorRaw = String(form.get("actor") ?? "staff");
+    const actor: "staff" | "anonymous" | "system" =
+      actorRaw === "staff" || actorRaw === "anonymous" || actorRaw === "system"
+        ? (actorRaw as "staff" | "anonymous" | "system")
+        : "staff";
+    const bodyMarkdown = String(form.get("bodyMarkdown") ?? "").trim();
+    if (!bodyMarkdown) {
+      return data(
+        { ok: false as const, error: "回复内容不能为空。" },
+        { status: 400 },
+      );
+    }
+
+    try {
+      // Prefer display_name in DB if present.
+      const supabase = getSupabaseAdminDb();
+      const { data: me, error } = await supabase
+        .from("users")
+        .select("display_name,username")
+        .eq("uid", admin.uid)
+        .maybeSingle();
+      if (error) throw new Error(`读取管理员信息失败：${error.message}`);
+      const display =
+        (me as any)?.display_name ?? (me as any)?.username ?? "管理员";
+
+      const result = await addAdminReplyBatch({
+        ticketIds,
+        actor,
+        authorUid: admin.uid,
+        authorDisplayName: display,
+        bodyMarkdown,
+      });
+
+      if (result.replied_ticket_ids.length === 0) {
+        return data(
+          { ok: false as const, error: "所选工单均已关闭，无法回复。" },
+          { status: 400 },
+        );
+      }
+
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "操作失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "batchClose") {
+    const ticketIds = form
+      .getAll("ticketIds")
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean);
+    if (ticketIds.length === 0) {
+      return data(
+        { ok: false as const, error: "请先选择至少一个未关闭的工单。" },
+        { status: 400 },
+      );
+    }
+
+    const reason = String(form.get("reason") ?? "").trim() || "已完成";
+
+    try {
+      const result = await closeTicketsAsAdminBatch({ ticketIds, reason });
+      if (result.closed_ticket_ids.length === 0) {
+        return data(
+          { ok: false as const, error: "所选工单均已关闭。" },
+          { status: 400 },
+        );
+      }
+      return redirect(returnTo);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "操作失败。" },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (intent === "createTicket") {
+    const categoryId = String(form.get("categoryId") ?? "");
+    const subject = String(form.get("subject") ?? "").trim();
+    const bodyMarkdown = String(form.get("bodyMarkdown") ?? "").trim();
+    const isGlobal = String(form.get("isGlobal") ?? "0") === "1";
+
+    const participantUids = form
+      .getAll("participantUids")
+      .map((v) => Number(String(v ?? "").trim()))
+      .filter((v) => Number.isFinite(v));
+
+    if (!categoryId) {
+      return data(
+        { ok: false as const, error: "请先选择工单类别。" },
+        { status: 400 },
+      );
+    }
+    if (!subject) {
+      return data(
+        { ok: false as const, error: "请填写标题。" },
+        { status: 400 },
+      );
+    }
+    if (!bodyMarkdown) {
+      return data(
+        { ok: false as const, error: "请填写工单内容（支持 Markdown）。" },
+        { status: 400 },
+      );
+    }
+
+    const files = form
+      .getAll("attachments")
+      .filter((v): v is File => v instanceof File && v.size > 0);
+
+    let created: { id: string; messageId: string } | null = null;
+    try {
+      // Prefer display_name in DB if present.
+      const supabase = getSupabaseAdminDb();
+      const { data: me, error } = await supabase
+        .from("users")
+        .select("display_name,username")
+        .eq("uid", admin.uid)
+        .maybeSingle();
+      if (error) throw new Error(`读取管理员信息失败：${error.message}`);
+      const display =
+        (me as any)?.display_name ?? (me as any)?.username ?? "管理员";
+
+      created = await createTicketAsAdmin({
+        creatorUid: admin.uid,
+        creatorDisplayName: display,
+        categoryId,
+        subject,
+        formData: {},
+        bodyMarkdown,
+        participantUids,
+        isGlobal,
+      });
+
+      await uploadAttachments({
+        ticketId: created.id,
+        messageId: created.messageId,
+        uploaderUid: admin.uid,
+        files,
+      });
+    } catch (e: any) {
+      return data(
+        {
+          ok: false as const,
+          error: e instanceof Error ? e.message : "创建工单失败。",
+          createdTicketId: created?.id ?? null,
+        },
+        { status: 400 },
+      );
+    }
+
+    return redirect(`/admin/tickets/${created.id}${url.search}`);
+  }
+
+  if (intent === "mergeTickets") {
+    const targetTicketId = String(form.get("targetTicketId") ?? "").trim();
+    const sourceTicketIds = form
+      .getAll("sourceTicketIds")
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean);
+    const reason = String(form.get("reason") ?? "").trim();
+
+    if (!targetTicketId) {
+      return data(
+        { ok: false as const, error: "请先选择一个目标工单。" },
+        { status: 400 },
+      );
+    }
+    if (sourceTicketIds.length === 0) {
+      return data(
+        { ok: false as const, error: "请先选择至少一个待合并的工单。" },
+        { status: 400 },
+      );
+    }
+
+    try {
+      const result = await mergeTicketsAsAdmin({
+        targetTicketId,
+        sourceTicketIds,
+        mergedByUid: admin.uid,
+        mergedReason: reason,
+      });
+      if (result.merged_source_ticket_ids.length === 0) {
+        return data(
+          { ok: false as const, error: "没有可合并的工单（可能已被合并）。" },
+          { status: 400 },
+        );
+      }
+      return redirect(`/admin/tickets/${targetTicketId}${url.search}`);
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "合并失败。" },
+        { status: 500 },
       );
     }
   }
@@ -226,11 +459,21 @@ export default function AdminTickets({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const categoryMap = new Map(loaderData.categories.map((c) => [c.id, c.name]));
-  const userMap = new Map(
-    loaderData.users.map((u) => [u.uid, u.display_name ?? u.username]),
+  const categoryMap = useMemo(
+    () => new Map(loaderData.categories.map((c) => [c.id, c.name])),
+    [loaderData.categories],
   );
-  const adminUsers = loaderData.users.filter((u) => u.is_admin);
+  const userMap = useMemo(
+    () =>
+      new Map(
+        loaderData.users.map((u) => [u.uid, u.display_name ?? u.username]),
+      ),
+    [loaderData.users],
+  );
+  const adminUsers = useMemo(
+    () => loaderData.users.filter((u) => u.is_admin),
+    [loaderData.users],
+  );
 
   const submit = useSubmit();
   const location = useLocation();
@@ -239,6 +482,38 @@ export default function AdminTickets({
 
   const selectedTicketId = params.ticketId;
   const detailScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const [selectedTicketIds, setSelectedTicketIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const selectableTicketIds = loaderData.tickets
+    .filter((t) => t.status !== "closed")
+    .map((t) => t.id);
+  const selectedOpenTicketIds = loaderData.tickets
+    .filter((t) => t.status !== "closed" && selectedTicketIds.has(t.id))
+    .map((t) => t.id);
+  const mergeableSourceTicketIds = selectedTicketId
+    ? selectedOpenTicketIds.filter((id) => id !== selectedTicketId)
+    : [];
+  const targetTicket = selectedTicketId
+    ? loaderData.tickets.find((t) => t.id === selectedTicketId) ?? null
+    : null;
+  const allSelectableSelected =
+    selectableTicketIds.length > 0 &&
+    selectableTicketIds.every((id) => selectedTicketIds.has(id));
+  const someSelectableSelected =
+    selectableTicketIds.some((id) => selectedTicketIds.has(id)) &&
+    !allSelectableSelected;
+
+  const batchReplyModal = useDisclosure();
+  const batchCloseModal = useDisclosure();
+  const createTicketModal = useDisclosure();
+  const mergeTicketsModal = useDisclosure();
+
+  const [createIsGlobal, setCreateIsGlobal] = useState(false);
+  const [createParticipantKeys, setCreateParticipantKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   const submitTimerRef = useRef<number | null>(null);
   useEffect(() => {
@@ -262,55 +537,168 @@ export default function AdminTickets({
     detailScrollRef.current?.scrollTo({ top: 0 });
   }, [selectedTicketId]);
 
+  useEffect(() => {
+    const selectable = new Set(
+      loaderData.tickets.filter((t) => t.status !== "closed").map((t) => t.id),
+    );
+    setSelectedTicketIds((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (selectable.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [loaderData.tickets]);
+
   const selectedStatuses = loaderData.filters.statuses ?? [];
   const selectedAssigned = loaderData.filters.assigned ?? [];
   const qValue = String(loaderData.filters.q ?? "");
   const sortValue = String(loaderData.filters.sort ?? "updated_at");
   const dirValue = String(loaderData.filters.dir ?? "desc");
+  const createdTicketId = (actionData as any)?.createdTicketId as
+    | string
+    | null
+    | undefined;
 
   return (
-    <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-2 overflow-hidden">
-      <section className="min-h-0 flex flex-col rounded-medium border border-default-200 overflow-hidden">
-        <div className="p-2 border-b border-default-200">
-          <div className="flex items-center justify-between gap-2">
-            <div className="text-sm font-semibold">
-              工单列表
-              <span className="ml-2 text-xs text-default-500">
-                {loaderData.tickets.length}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="flat"
-                className="h-8 px-3 text-sm"
-                isLoading={revalidator.state === "loading"}
-                onPress={() => revalidator.revalidate()}
-              >
-                刷新
-              </Button>
-              <Form method="post">
-                <input type="hidden" name="_intent" value="recomputeSmartScores" />
+    <>
+      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-2 overflow-hidden">
+        <section className="min-h-0 flex flex-col rounded-medium border border-default-200 overflow-hidden">
+          <div className="p-2 border-b border-default-200">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold">
+                工单列表
+                <span className="ml-2 text-xs text-default-500">
+                  {loaderData.tickets.length}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
                 <Button
-                  type="submit"
+                  color="primary"
                   variant="flat"
                   className="h-8 px-3 text-sm"
+                  onPress={createTicketModal.onOpen}
                 >
-                  立刻计算
+                  新建共同工单
                 </Button>
-              </Form>
+                <Button
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                  isLoading={revalidator.state === "loading"}
+                  onPress={() => revalidator.revalidate()}
+                >
+                  刷新
+                </Button>
+                <Form method="post">
+                  <input
+                    type="hidden"
+                    name="_intent"
+                    value="recomputeSmartScores"
+                  />
+                  <Button
+                    type="submit"
+                    variant="flat"
+                    className="h-8 px-3 text-sm"
+                  >
+                    立刻计算
+                  </Button>
+                </Form>
+              </div>
             </div>
-          </div>
 
-          {actionData?.ok === false ? (
-            <div className="mt-2 text-xs text-danger">{actionData.error}</div>
-          ) : null}
+            {actionData?.ok === false ? (
+              <div className="mt-2 space-y-1 text-xs">
+                <div className="text-danger">{actionData.error}</div>
+                {createdTicketId ? (
+                  <NavLink
+                    className="text-primary underline"
+                    to={{ pathname: createdTicketId, search: location.search }}
+                  >
+                    查看已创建工单
+                  </NavLink>
+                ) : null}
+              </div>
+            ) : null}
 
-          <Form
-            key={location.search}
-            method="get"
-            replace
-            className="mt-2 grid grid-cols-2 gap-2"
-          >
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  isSelected={allSelectableSelected}
+                  isIndeterminate={someSelectableSelected}
+                  isDisabled={selectableTicketIds.length === 0}
+                  onValueChange={(checked) => {
+                    setSelectedTicketIds((prev) => {
+                      const next = new Set(prev);
+                      if (checked) {
+                        for (const id of selectableTicketIds) next.add(id);
+                      } else {
+                        for (const id of selectableTicketIds) next.delete(id);
+                      }
+                      return next;
+                    });
+                  }}
+                >
+                  全选
+                </Checkbox>
+                <div className="text-xs text-default-500">
+                  已选择 {selectedOpenTicketIds.length}
+                </div>
+                {selectedOpenTicketIds.length > 0 ? (
+                  <Button
+                    variant="light"
+                    className="h-8 px-2 text-sm"
+                    onPress={() => setSelectedTicketIds(new Set())}
+                  >
+                    清空
+                  </Button>
+                ) : null}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button
+                  color="primary"
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                  isDisabled={selectedOpenTicketIds.length === 0}
+                  onPress={batchReplyModal.onOpen}
+                >
+                  批量回复
+                </Button>
+                <Button
+                  color="secondary"
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                  isDisabled={
+                    !selectedTicketId ||
+                    !targetTicket ||
+                    targetTicket.status === "closed" ||
+                    mergeableSourceTicketIds.length === 0
+                  }
+                  onPress={mergeTicketsModal.onOpen}
+                >
+                  合并到当前
+                </Button>
+                <Button
+                  color="danger"
+                  variant="flat"
+                  className="h-8 px-3 text-sm"
+                  isDisabled={selectedOpenTicketIds.length === 0}
+                  onPress={batchCloseModal.onOpen}
+                >
+                  批量关闭
+                </Button>
+              </div>
+            </div>
+
+            <Form
+              key={location.search}
+              method="get"
+              replace
+              className="mt-2 grid grid-cols-2 gap-2"
+            >
             <label className="text-xs text-default-600">
               状态
               <div className="mt-1 flex flex-wrap gap-1">
@@ -440,67 +828,87 @@ export default function AdminTickets({
                     ? t.smart_urgency_score.toFixed(2)
                     : "未计算";
 
+                const isClosed = t.status === "closed";
+                const isActive = selectedTicketId === t.id;
                 return (
-                  <NavLink
+                  <div
                     key={t.id}
-                    to={{ pathname: t.id, search: location.search }}
-                    className={({ isActive }) =>
-                      [
-                        "block border-b border-default-200 px-2 py-2 hover:bg-default-100",
-                        isActive ? "bg-default-100" : "",
-                      ].join(" ")
-                    }
-                    aria-current={
-                      selectedTicketId === t.id ? "page" : undefined
-                    }
+                    className={[
+                      "border-b border-default-200 px-2 py-2 hover:bg-default-100",
+                      isActive ? "bg-default-100" : "",
+                    ].join(" ")}
                   >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-mono text-xs text-default-500">
-                            #{t.short_id}
-                          </span>
-                          {t.nudge_pending ? (
-                            <span
-                              title={
-                                t.nudge_last_at
-                                  ? `客户催单：${formatCompactDateTime(t.nudge_last_at)}`
-                                  : "客户催单"
-                              }
-                              className="text-warning text-xs"
-                            >
-                              ★
-                            </span>
-                          ) : null}
-                          <div className="text-sm font-medium truncate">
-                            {t.subject}
+                    <div className="flex items-start gap-2">
+                      <div className="pt-0.5">
+                        <Checkbox
+                          aria-label={`选择工单 #${t.short_id}`}
+                          isSelected={selectedTicketIds.has(t.id)}
+                          isDisabled={isClosed}
+                          onValueChange={(checked) => {
+                            setSelectedTicketIds((prev) => {
+                              const next = new Set(prev);
+                              if (checked) next.add(t.id);
+                              else next.delete(t.id);
+                              return next;
+                            });
+                          }}
+                        />
+                      </div>
+
+                      <NavLink
+                        to={{ pathname: t.id, search: location.search }}
+                        className="flex-1 min-w-0"
+                        aria-current={isActive ? "page" : undefined}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-mono text-xs text-default-500">
+                                #{t.short_id}
+                              </span>
+                              {t.nudge_pending ? (
+                                <span
+                                  title={
+                                    t.nudge_last_at
+                                      ? `客户催单：${formatCompactDateTime(t.nudge_last_at)}`
+                                      : "客户催单"
+                                  }
+                                  className="text-warning text-xs"
+                                >
+                                  ★
+                                </span>
+                              ) : null}
+                              <div className="text-sm font-medium truncate">
+                                {t.subject}
+                              </div>
+                            </div>
+                            <div className="mt-0.5 text-xs text-default-500 truncate">
+                              {creator} · {category} ·{" "}
+                              {formatCompactDateTime(t.updated_at)}
+                            </div>
+                          </div>
+                          <div className="shrink-0 flex flex-col items-end gap-1">
+                            <StatusChip status={t.status} />
+                            <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
+                              {assignee}
+                            </div>
+                            {showSmartScore ? (
+                              <div
+                                className="text-[11px] text-default-500"
+                                title={
+                                  t.smart_computed_at
+                                    ? `智能分数计算时间：${formatCompactDateTime(t.smart_computed_at)}`
+                                    : "智能分数尚未计算"
+                                }
+                              >
+                                分: {smartScoreText}
+                              </div>
+                            ) : null}
                           </div>
                         </div>
-                        <div className="mt-0.5 text-xs text-default-500 truncate">
-                          {creator} · {category} ·{" "}
-                          {formatCompactDateTime(t.updated_at)}
-                        </div>
-                      </div>
-                      <div className="shrink-0 flex flex-col items-end gap-1">
-                        <StatusChip status={t.status} />
-                        <div className="text-[11px] text-default-500 max-w-[10rem] truncate">
-                          {assignee}
-                        </div>
-                        {showSmartScore ? (
-                          <div
-                            className="text-[11px] text-default-500"
-                            title={
-                              t.smart_computed_at
-                                ? `智能分数计算时间：${formatCompactDateTime(t.smart_computed_at)}`
-                                : "智能分数尚未计算"
-                            }
-                          >
-                            分: {smartScoreText}
-                          </div>
-                        ) : null}
-                      </div>
+                      </NavLink>
                     </div>
-                  </NavLink>
+                  </div>
                 );
               })}
             </div>
@@ -508,17 +916,235 @@ export default function AdminTickets({
         </div>
       </section>
 
-      <section className="min-h-0 rounded-medium border border-default-200 overflow-hidden flex flex-col">
-        <div ref={detailScrollRef} className="flex-1 min-h-0 overflow-auto">
-          {selectedTicketId ? (
-            <Outlet />
-          ) : (
-            <div className="h-full flex items-center justify-center p-6 text-sm text-default-500">
-              从左侧选择一个工单以查看详情与回复。
-            </div>
-          )}
-        </div>
-      </section>
-    </div>
+        <section className="min-h-0 rounded-medium border border-default-200 overflow-hidden flex flex-col">
+          <div ref={detailScrollRef} className="flex-1 min-h-0 overflow-auto">
+            {selectedTicketId ? (
+              <Outlet />
+            ) : (
+              <div className="h-full flex items-center justify-center p-6 text-sm text-default-500">
+                从左侧选择一个工单以查看详情与回复。
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <Modal isOpen={batchReplyModal.isOpen} onClose={batchReplyModal.onClose}>
+        <ModalContent>
+          <Form method="post" onSubmit={batchReplyModal.onClose}>
+            <input type="hidden" name="_intent" value="batchReply" />
+            {selectedOpenTicketIds.map((id) => (
+              <input key={id} type="hidden" name="ticketIds" value={id} />
+            ))}
+            <ModalHeader>批量回复</ModalHeader>
+            <ModalBody>
+              <div className="text-sm text-default-600">
+                将向 {selectedOpenTicketIds.length} 个工单发送同一条回复。
+              </div>
+
+              <Select
+                name="actor"
+                label="回复身份"
+                defaultSelectedKeys={["staff"]}
+              >
+                <SelectItem key="staff">操作员</SelectItem>
+                <SelectItem key="anonymous">匿名</SelectItem>
+                <SelectItem key="system">系统</SelectItem>
+              </Select>
+              <Textarea
+                name="bodyMarkdown"
+                label="回复内容（Markdown）"
+                minRows={6}
+                isRequired
+              />
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={batchReplyModal.onClose}>
+                取消
+              </Button>
+              <Button color="primary" type="submit">
+                确认发送
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={batchCloseModal.isOpen} onClose={batchCloseModal.onClose}>
+        <ModalContent>
+          <Form method="post" onSubmit={batchCloseModal.onClose}>
+            <input type="hidden" name="_intent" value="batchClose" />
+            {selectedOpenTicketIds.map((id) => (
+              <input key={id} type="hidden" name="ticketIds" value={id} />
+            ))}
+            <ModalHeader>批量关闭工单</ModalHeader>
+            <ModalBody>
+              <div className="text-sm text-default-600">
+                将关闭 {selectedOpenTicketIds.length} 个工单。
+              </div>
+              <Input
+                name="reason"
+                label="关闭原因（可选）"
+                placeholder="例如：已完成 / 其它（可自填写）"
+              />
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={batchCloseModal.onClose}>
+                取消
+              </Button>
+              <Button color="danger" type="submit">
+                确认关闭
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={createTicketModal.isOpen} onClose={createTicketModal.onClose}>
+        <ModalContent>
+          <Form
+            method="post"
+            onSubmit={createTicketModal.onClose}
+            encType="multipart/form-data"
+            className="space-y-2"
+          >
+            <input type="hidden" name="_intent" value="createTicket" />
+            <input
+              type="hidden"
+              name="isGlobal"
+              value={createIsGlobal ? "1" : "0"}
+            />
+            <ModalHeader>新建共同工单</ModalHeader>
+            <ModalBody className="space-y-3">
+              <Select
+                name="categoryId"
+                label="工单类别"
+                isRequired
+                placeholder="选择类别"
+              >
+                {loaderData.categories.map((c) => (
+                  <SelectItem key={c.id}>{c.name}</SelectItem>
+                ))}
+              </Select>
+
+              <Input name="subject" label="标题" isRequired />
+
+              <Textarea
+                name="bodyMarkdown"
+                label="工单内容（Markdown）"
+                minRows={6}
+                isRequired
+              />
+
+              <Checkbox
+                isSelected={createIsGlobal}
+                onValueChange={(checked) => {
+                  setCreateIsGlobal(checked);
+                  if (checked) setCreateParticipantKeys(new Set());
+                }}
+              >
+                所有用户（全体共同工单）
+              </Checkbox>
+
+              <Select
+                name="participantUids"
+                label="涉及用户"
+                selectionMode="multiple"
+                placeholder={createIsGlobal ? "已选择所有用户" : "选择一个或多个用户"}
+                isDisabled={createIsGlobal}
+                selectedKeys={createParticipantKeys}
+                onSelectionChange={(keys: any) => {
+                  if (keys === "all") return;
+                  setCreateParticipantKeys(
+                    new Set(Array.from(keys).map((k) => String(k))),
+                  );
+                }}
+              >
+                {loaderData.users
+                  .filter((u) => !u.is_admin)
+                  .map((u) => (
+                    <SelectItem key={String(u.uid)}>
+                      {u.display_name ?? u.username} (uid:{u.uid})
+                    </SelectItem>
+                  ))}
+              </Select>
+
+              <div className="space-y-1">
+                <div className="text-sm font-medium">附件（可选）</div>
+                <input
+                  type="file"
+                  name="attachments"
+                  multiple
+                  className="block w-full text-sm"
+                />
+                <div className="text-xs text-default-500">单文件不超过 2MB。</div>
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={createTicketModal.onClose}>
+                取消
+              </Button>
+              <Button
+                color="primary"
+                type="submit"
+                isDisabled={!createIsGlobal && createParticipantKeys.size === 0}
+              >
+                创建
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={mergeTicketsModal.isOpen} onClose={mergeTicketsModal.onClose}>
+        <ModalContent>
+          <Form method="post" onSubmit={mergeTicketsModal.onClose}>
+            <input type="hidden" name="_intent" value="mergeTickets" />
+            <input
+              type="hidden"
+              name="targetTicketId"
+              value={selectedTicketId ?? ""}
+            />
+            {mergeableSourceTicketIds.map((id) => (
+              <input key={id} type="hidden" name="sourceTicketIds" value={id} />
+            ))}
+            <ModalHeader>合并工单</ModalHeader>
+            <ModalBody className="space-y-2">
+              <div className="text-sm text-default-600">
+                {targetTicket ? (
+                  <>
+                    目标工单：<span className="font-mono">#{targetTicket.short_id}</span>{" "}
+                    {targetTicket.subject}
+                  </>
+                ) : (
+                  "请先打开一个工单作为目标。"
+                )}
+              </div>
+              <div className="text-sm text-default-600">
+                将合并 {mergeableSourceTicketIds.length} 个工单到目标工单。
+              </div>
+              <Textarea
+                name="reason"
+                label="合并原因（可选）"
+                placeholder="例如：重复工单 / 同一问题集中处理"
+                minRows={3}
+              />
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="light" onPress={mergeTicketsModal.onClose}>
+                取消
+              </Button>
+              <Button
+                color="secondary"
+                type="submit"
+                isDisabled={!targetTicket || mergeableSourceTicketIds.length === 0}
+              >
+                确认合并
+              </Button>
+            </ModalFooter>
+          </Form>
+        </ModalContent>
+      </Modal>
+    </>
   );
 }

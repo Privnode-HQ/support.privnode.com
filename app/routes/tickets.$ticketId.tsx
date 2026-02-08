@@ -5,7 +5,6 @@ import {
   CardBody,
   CardHeader,
   Chip,
-  Divider,
   Input,
   Modal,
   ModalBody,
@@ -15,7 +14,7 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { Form, data, redirect } from "react-router";
+import { Form, Link, data, redirect } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ticketStatusLabel } from "../shared/tickets";
@@ -27,6 +26,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     getLatestTicketNudgeAt,
     getSmartQueuePositionForTicket,
     getTicketForUser,
+    listParticipantsForTicket,
     listMessages,
   } = await import("../server/models/tickets.server");
   const { listAttachmentsForTicket } =
@@ -41,17 +41,21 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     throw new Response("Not Found", { status: 404 });
   }
 
+  const isCreator = ticket.creator_uid === user.uid;
+
   const smartQueuePromise =
     ticket.status === "closed"
       ? Promise.resolve(null)
       : getSmartQueuePositionForTicket(ticketId).catch(() => null);
 
-  const [messages, attachments, lastNudgedAt, smartQueue] = await Promise.all([
-    listMessages(ticketId),
-    listAttachmentsForTicket(ticketId),
-    getLatestTicketNudgeAt(ticketId),
-    smartQueuePromise,
-  ]);
+  const [messages, attachments, participants, lastNudgedAt, smartQueue] =
+    await Promise.all([
+      listMessages(ticketId),
+      listAttachmentsForTicket(ticketId),
+      listParticipantsForTicket(ticketId),
+      getLatestTicketNudgeAt(ticketId),
+      smartQueuePromise,
+    ]);
 
   // Process ticket links in message markdown
   const processedMessages = await Promise.all(
@@ -71,27 +75,37 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const baseMs = Math.max(createdAtMs, lastNudgedAtMs ?? 0);
   const nextAllowedAtMs = baseMs + TICKET_NUDGE_COOLDOWN_MS;
   const canNudge = ticket.status !== "closed" && nowMs >= nextAllowedAtMs;
+  const canNudgeByUser = isCreator && canNudge;
+  const canCloseByUser = isCreator && ticket.status !== "closed";
 
   const nudgeDisabledReason =
     ticket.status === "closed"
       ? "工单已关闭。"
-      : canNudge
-        ? null
-        : lastNudgedAt
-          ? "距离上次催单不足 6 小时。"
-          : "工单创建后 6 小时内无法催单。";
+      : !isCreator
+        ? "仅工单创建者可催单。"
+        : canNudge
+          ? null
+          : lastNudgedAt
+            ? "距离上次催单不足 6 小时。"
+            : "工单创建后 6 小时内无法催单。";
 
   return data({
+    me: { uid: user.uid },
     ticket,
     messages: processedMessages,
     attachments,
+    participants,
     nudge: {
       last_nudged_at: lastNudgedAt,
       next_allowed_at: new Date(nextAllowedAtMs).toISOString(),
-      can_nudge: canNudge,
+      can_nudge: canNudgeByUser,
       disabled_reason: nudgeDisabledReason,
     },
     queue: smartQueue,
+    permissions: {
+      is_creator: isCreator,
+      can_close: canCloseByUser,
+    },
   });
 }
 
@@ -119,14 +133,16 @@ export async function action({ request, params }: Route.ActionArgs) {
         { status: 400 },
       );
     }
-    const { messageId } = await addCustomerReply({
-      uid: user.uid,
-      displayName: user.username,
-      ticketId,
-      bodyMarkdown,
-    });
-
+    let messageId: string | null = null;
     try {
+      const res = await addCustomerReply({
+        uid: user.uid,
+        displayName: user.username,
+        ticketId,
+        bodyMarkdown,
+      });
+      messageId = res.messageId;
+
       await uploadAttachments({
         ticketId,
         messageId,
@@ -138,7 +154,11 @@ export async function action({ request, params }: Route.ActionArgs) {
         {
           ok: false as const,
           error:
-            e instanceof Error ? e.message : "附件上传失败（回复已发送）。",
+            e instanceof Error
+              ? e.message
+              : messageId
+                ? "附件上传失败（回复已发送）。"
+                : "发送回复失败。",
         },
         { status: 400 },
       );
@@ -148,7 +168,14 @@ export async function action({ request, params }: Route.ActionArgs) {
 
   if (intent === "close") {
     const reason = String(form.get("reason") ?? "").trim() || "已完成";
-    await closeTicket({ uid: user.uid, ticketId, reason });
+    try {
+      await closeTicket({ uid: user.uid, ticketId, reason });
+    } catch (e: any) {
+      return data(
+        { ok: false as const, error: e instanceof Error ? e.message : "关闭失败。" },
+        { status: 400 },
+      );
+    }
     return redirect(`/tickets/${ticketId}`);
   }
 
@@ -182,7 +209,8 @@ export default function TicketDetail({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const { ticket, messages, attachments, nudge, queue } = loaderData;
+  const { me, ticket, messages, attachments, participants, nudge, queue, permissions } =
+    loaderData;
   const { isOpen, onOpen, onClose } = useDisclosure();
 
   // Reverse messages to show newest first
@@ -251,6 +279,15 @@ export default function TicketDetail({
                 #{ticket.short_id}
               </span>
               <h1 className="text-2xl font-semibold">{ticket.subject}</h1>
+              {ticket.is_global ? (
+                <Chip size="sm" variant="flat" color="secondary">
+                  全体
+                </Chip>
+              ) : ticket.creator_uid !== me.uid ? (
+                <Chip size="sm" variant="flat">
+                  共同
+                </Chip>
+              ) : null}
             </div>
             <div className="text-sm text-default-600">
               类别：{ticket.category_name ?? ticket.category_id}
@@ -260,7 +297,7 @@ export default function TicketDetail({
             <Chip color={statusColor as any} variant="flat">
               {ticketStatusLabel(ticket.status as any)}
             </Chip>
-            {ticket.status !== "closed" ? (
+            {ticket.status !== "closed" && permissions.is_creator ? (
               <Form method="post">
                 <input type="hidden" name="_intent" value="nudge" />
                 <Button
@@ -273,7 +310,7 @@ export default function TicketDetail({
                 </Button>
               </Form>
             ) : null}
-            {ticket.status !== "closed" && (
+            {ticket.status !== "closed" && permissions.can_close && (
               <Button color="danger" variant="flat" onPress={onOpen}>
                 关闭工单
               </Button>
@@ -293,7 +330,7 @@ export default function TicketDetail({
           </div>
         ) : null}
 
-        {ticket.status !== "closed" && !nudge.can_nudge ? (
+        {ticket.status !== "closed" && permissions.is_creator && !nudge.can_nudge ? (
           <div className="text-xs text-default-500">
             {nudge.disabled_reason ?? "暂时无法催单。"} 下次可在{" "}
             {new Date(nudge.next_allowed_at).toLocaleString("zh-CN")} 之后催单。
@@ -305,11 +342,44 @@ export default function TicketDetail({
             关闭原因：{ticket.closed_reason ?? "-"}
           </div>
         ) : null}
+
+        {ticket.merged_into_ticket_id ? (
+          <div className="text-sm text-warning">
+            该工单已合并到主工单：{" "}
+            <Link
+              className="text-primary underline"
+              to={`/tickets/${ticket.merged_into_ticket_id}`}
+            >
+              点击查看
+            </Link>
+          </div>
+        ) : null}
       </div>
 
       {actionData?.ok === false ? (
         <p className="text-danger">{actionData.error}</p>
       ) : null}
+
+      <details className="rounded-medium border border-default-200">
+        <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+          涉及用户
+        </summary>
+        <div className="px-3 pb-3">
+          {ticket.is_global ? (
+            <div className="text-sm text-default-600">所有用户</div>
+          ) : participants.length === 0 ? (
+            <div className="text-sm text-default-600">仅创建者</div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {participants.map((u) => (
+                <Chip key={u.uid} size="sm" variant="flat">
+                  {u.display_name ?? u.username} (uid:{u.uid})
+                </Chip>
+              ))}
+            </div>
+          )}
+        </div>
+      </details>
 
       {ticket.status !== "closed" && <ReplyForm />}
 

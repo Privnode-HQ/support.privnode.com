@@ -16,7 +16,7 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { Form, data, redirect } from "react-router";
+import { Form, Link, data, redirect } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { requireAdmin } from "../server/admin";
@@ -28,7 +28,7 @@ import {
   listAllCategories,
   listAllUsers,
 } from "../server/models/admin.server";
-import { listMessages } from "../server/models/tickets.server";
+import { listMessages, listParticipantsForTicket } from "../server/models/tickets.server";
 import { ticketStatusLabel } from "../shared/tickets";
 import { getSupabaseAdminDb } from "../server/supabase.server";
 import {
@@ -41,10 +41,11 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const ticketId = params.ticketId;
   const { processTicketLinks } = await import("../server/markdown.server");
 
-  const [ticket, messages, attachments, categories, users] = await Promise.all([
+  const [ticket, messages, attachments, participants, categories, users] = await Promise.all([
     getTicketById(ticketId),
     listMessages(ticketId),
     listAttachmentsForTicket(ticketId),
+    listParticipantsForTicket(ticketId),
     listAllCategories(),
     listAllUsers(),
   ]);
@@ -63,6 +64,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     ticket,
     messages: processedMessages,
     attachments,
+    participants,
     categories,
     users,
   });
@@ -162,7 +164,7 @@ export default function AdminTicketDetail({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const { ticket, messages, attachments, categories, users } = loaderData;
+  const { ticket, messages, attachments, participants, categories, users } = loaderData;
   const categoryMap = new Map(categories.map((c) => [c.id, c.name]));
   const userMap = new Map(users.map((u) => [u.uid, u.display_name ?? u.username]));
   const { isOpen, onOpen, onClose } = useDisclosure();
@@ -177,6 +179,24 @@ export default function AdminTicketDetail({
     list.push(a);
     attachmentsByMessage.set(a.message_id, list);
   }
+
+  const participantsWithCreator = (() => {
+    if (ticket.is_global) return [];
+    const uidSet = new Set(participants.map((p) => p.uid));
+    const list = [...participants];
+    if (!uidSet.has(ticket.creator_uid)) {
+      const creator = users.find((u) => u.uid === ticket.creator_uid);
+      if (creator) {
+        list.unshift({
+          uid: creator.uid,
+          username: creator.username,
+          display_name: creator.display_name ?? null,
+          is_admin: Boolean(creator.is_admin),
+        });
+      }
+    }
+    return list;
+  })();
 
   const statusColor =
     ticket.status === "closed"
@@ -240,8 +260,14 @@ export default function AdminTicketDetail({
               <h1 className="text-base font-semibold truncate">{ticket.subject}</h1>
             </div>
             <div className="mt-0.5 text-xs text-default-500 truncate">
-              客户：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} (uid:{ticket.creator_uid}) ·
-              类别：{categoryMap.get(ticket.category_id) ?? ticket.category_id}
+              创建者：{userMap.get(ticket.creator_uid) ?? `uid:${ticket.creator_uid}`} (uid:{ticket.creator_uid}) ·
+              类别：{categoryMap.get(ticket.category_id) ?? ticket.category_id} ·
+              范围：
+              {ticket.is_global
+                ? "所有用户"
+                : participantsWithCreator.length > 0
+                  ? `${participantsWithCreator.length} 位用户`
+                  : "仅创建者"}
             </div>
             <div className="mt-0.5 text-xs text-default-500 truncate">
               创建：{new Date(ticket.created_at).toLocaleString("zh-CN")} · 更新：
@@ -258,6 +284,17 @@ export default function AdminTicketDetail({
             {ticket.status === "closed" ? (
               <div className="mt-0.5 text-xs text-default-600 truncate">
                 关闭原因：{ticket.closed_reason ?? "-"}
+              </div>
+            ) : null}
+            {ticket.merged_into_ticket_id ? (
+              <div className="mt-0.5 text-xs text-warning truncate">
+                该工单已合并到主工单：{" "}
+                <Link
+                  className="text-primary underline"
+                  to={`/admin/tickets/${ticket.merged_into_ticket_id}`}
+                >
+                  查看主工单
+                </Link>
               </div>
             ) : null}
           </div>
@@ -296,6 +333,27 @@ export default function AdminTicketDetail({
       {actionData?.ok === false ? (
         <p className="text-danger text-sm">{actionData.error}</p>
       ) : null}
+
+      <details className="rounded-medium border border-default-200">
+        <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+          涉及用户
+        </summary>
+        <div className="px-3 pb-3">
+          {ticket.is_global ? (
+            <div className="text-sm text-default-600">所有用户</div>
+          ) : participantsWithCreator.length === 0 ? (
+            <div className="text-sm text-default-600">仅创建者</div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {participantsWithCreator.map((u) => (
+                <Chip key={u.uid} size="sm" variant="flat">
+                  {u.display_name ?? u.username} (uid:{u.uid})
+                </Chip>
+              ))}
+            </div>
+          )}
+        </div>
+      </details>
 
       <details className="rounded-medium border border-default-200">
         <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">

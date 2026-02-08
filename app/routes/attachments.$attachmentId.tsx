@@ -6,6 +6,7 @@ import {
   createAttachmentDownloadUrl,
   getAttachmentById,
 } from "../server/models/attachments.server";
+import { canUserAccessTicket } from "../server/models/tickets.server";
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const user = await requireUser(request);
@@ -26,15 +27,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const isAdmin = Boolean((u as any)?.is_admin);
 
   if (!isAdmin) {
-    // Customer can only download attachments from their own tickets.
-    const { data: t, error: tErr } = await supabase
-      .from("tickets")
-      .select("id")
-      .eq("id", attachment.ticket_id)
-      .eq("creator_uid", user.uid)
-      .maybeSingle();
-    if (tErr) throw new Error(`校验权限失败：${tErr.message}`);
-    if (!t) throw new Response("Forbidden", { status: 403 });
+    const ok = await canUserAccessTicket(user.uid, attachment.ticket_id);
+    if (!ok) throw new Response("Forbidden", { status: 403 });
   }
 
   const signedUrl = await createAttachmentDownloadUrl({

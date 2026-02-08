@@ -13,6 +13,17 @@ const OPEN_TICKET_STATUSES: TicketStatus[] = [
   "replied_by_customer",
 ];
 
+function chunkArray<T>(list: T[], chunkSize: number): T[][] {
+  const size = Math.max(1, Math.floor(chunkSize));
+  const chunks: T[][] = [];
+  for (let i = 0; i < list.length; i += size) {
+    chunks.push(list.slice(i, i + size));
+  }
+  return chunks;
+}
+
+const POSTGREST_IN_CHUNK_SIZE = 80;
+
 export type TicketListItem = {
   id: string;
   short_id: string;
@@ -20,6 +31,8 @@ export type TicketListItem = {
   status: TicketStatus;
   category_id: string;
   category_name: string | null;
+  creator_uid: number;
+  is_global: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -32,6 +45,11 @@ export type TicketDetails = {
   category_id: string;
   category_name: string | null;
   form_data: any;
+  creator_uid: number;
+  is_global: boolean;
+  merged_into_ticket_id: string | null;
+  merged_at: string | null;
+  merged_reason: string | null;
   assigned_to_uid: number | null;
   closed_reason: string | null;
   created_at: string;
@@ -176,14 +194,58 @@ export async function getSmartQueuePositionForTicket(ticketId: string): Promise<
 export async function listTicketsForUser(uid: number): Promise<TicketListItem[]> {
   const supabase = getSupabaseAdminDb();
 
-  const { data: tickets, error } = await supabase
+  const { data: createdTickets, error: cErr } = await supabase
     .from("tickets")
-    .select("id,short_id,subject,status,category_id,created_at,updated_at")
-    .eq("creator_uid", uid)
-    .order("updated_at", { ascending: false });
+    .select(
+      "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
+    )
+    .eq("creator_uid", uid);
+  if (cErr) throw new Error(`读取工单失败：${cErr.message}`);
 
-  if (error) throw new Error(`读取工单失败：${error.message}`);
-  const list = (tickets ?? []) as Omit<TicketListItem, "category_name">[];
+  const { data: globalTickets, error: gErr } = await supabase
+    .from("tickets")
+    .select(
+      "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
+    )
+    .eq("is_global", true);
+  if (gErr) throw new Error(`读取工单失败：${gErr.message}`);
+
+  const { data: participantRows, error: pErr } = await supabase
+    .from("ticket_participants")
+    .select("ticket_id")
+    .eq("uid", uid);
+  if (pErr) throw new Error(`读取参与工单失败：${pErr.message}`);
+
+  const participantTicketIds = Array.from(
+    new Set((participantRows ?? []).map((r) => String((r as any).ticket_id ?? "")).filter(Boolean))
+  );
+
+  const participantTickets: any[] = [];
+  for (const ids of chunkArray(participantTicketIds, POSTGREST_IN_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tickets")
+      .select(
+        "id,short_id,subject,status,category_id,creator_uid,is_global,created_at,updated_at"
+      )
+      .in("id", ids);
+    if (error) throw new Error(`读取参与工单失败：${error.message}`);
+    participantTickets.push(...(data ?? []));
+  }
+
+  const byId = new Map<string, any>();
+  for (const t of [...(createdTickets ?? []), ...participantTickets, ...(globalTickets ?? [])]) {
+    const id = String((t as any).id ?? "");
+    if (!id) continue;
+    byId.set(id, t);
+  }
+
+  const list = Array.from(byId.values()) as Omit<TicketListItem, "category_name">[];
+  list.sort((a, b) => {
+    const aMs = new Date(String((a as any).updated_at ?? "")).getTime();
+    const bMs = new Date(String((b as any).updated_at ?? "")).getTime();
+    if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) return bMs - aMs;
+    return String((b as any).id ?? "").localeCompare(String((a as any).id ?? ""));
+  });
 
   const categoryIds = Array.from(new Set(list.map((t) => t.category_id)));
   const categoryMap = new Map<string, string>();
@@ -229,6 +291,18 @@ export async function createTicket(params: {
   if (error) throw new Error(`创建工单失败：${error.message}`);
 
   const ticketId = (ticket as any).id as string;
+
+  try {
+    const { error: pErr } = await supabase.from("ticket_participants").insert({
+      ticket_id: ticketId,
+      uid: params.creatorUid,
+    });
+    if (pErr) throw pErr;
+  } catch (e) {
+    // best-effort: creator_uid already grants access; do not fail ticket creation.
+    console.error("Failed to insert ticket participant row:", e);
+  }
+
   const { data: msg, error: msgErr } = await supabase
     .from("ticket_messages")
     .insert({
@@ -253,13 +327,27 @@ export async function getTicketForUser(params: {
   const { data: t, error } = await supabase
     .from("tickets")
     .select(
-      "id,short_id,subject,status,category_id,form_data,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
+      "id,short_id,subject,status,category_id,form_data,creator_uid,is_global,merged_into_ticket_id,merged_at,merged_reason,assigned_to_uid,closed_reason,created_at,updated_at,closed_at"
     )
     .eq("id", params.ticketId)
-    .eq("creator_uid", params.uid)
     .maybeSingle();
   if (error) throw new Error(`读取工单失败：${error.message}`);
   if (!t) return null;
+
+  const creatorUid = Number((t as any).creator_uid);
+  const isGlobal = Boolean((t as any).is_global);
+  const isCreator = Number.isFinite(creatorUid) && creatorUid === params.uid;
+
+  if (!isGlobal && !isCreator) {
+    const { data: p, error: pErr } = await supabase
+      .from("ticket_participants")
+      .select("ticket_id")
+      .eq("ticket_id", params.ticketId)
+      .eq("uid", params.uid)
+      .maybeSingle();
+    if (pErr) throw new Error(`校验权限失败：${pErr.message}`);
+    if (!p) return null;
+  }
 
   const categoryId = (t as any).category_id as string;
   let categoryName: string | null = null;
@@ -296,15 +384,29 @@ export async function addCustomerReply(params: {
 }): Promise<{ messageId: string }> {
   const supabase = getSupabaseAdminDb();
 
-  // Ensure ticket belongs to user and isn't closed.
+  // Ensure user can access ticket and isn't closed.
   const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("id,status")
+    .select("id,status,creator_uid,is_global")
     .eq("id", params.ticketId)
-    .eq("creator_uid", params.uid)
     .maybeSingle();
   if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
   if (!t) throw new Error("工单不存在或无权限。");
+
+  const creatorUid = Number((t as any).creator_uid);
+  const isGlobal = Boolean((t as any).is_global);
+  const isCreator = Number.isFinite(creatorUid) && creatorUid === params.uid;
+  if (!isGlobal && !isCreator) {
+    const { data: p, error: pErr } = await supabase
+      .from("ticket_participants")
+      .select("ticket_id")
+      .eq("ticket_id", params.ticketId)
+      .eq("uid", params.uid)
+      .maybeSingle();
+    if (pErr) throw new Error(`校验权限失败：${pErr.message}`);
+    if (!p) throw new Error("工单不存在或无权限。");
+  }
+
   if ((t as any).status === "closed") throw new Error("工单已关闭，无法回复。");
 
   const { data: msg, error: msgErr } = await supabase
@@ -336,6 +438,18 @@ export async function closeTicket(params: {
 }) {
   const supabase = getSupabaseAdminDb();
 
+  const { data: t, error: tErr } = await supabase
+    .from("tickets")
+    .select("creator_uid,status")
+    .eq("id", params.ticketId)
+    .maybeSingle();
+  if (tErr) throw new Error(`读取工单失败：${tErr.message}`);
+  if (!t) throw new Error("工单不存在或无权限。");
+  if ((t as any).status === "closed") return;
+  if (Number((t as any).creator_uid) !== params.uid) {
+    throw new Error("仅工单创建者可以关闭工单。");
+  }
+
   const reason = params.reason.trim() || "已完成";
   const { data: updated, error } = await supabase
     .from("tickets")
@@ -345,7 +459,6 @@ export async function closeTicket(params: {
       closed_at: new Date().toISOString(),
     })
     .eq("id", params.ticketId)
-    .eq("creator_uid", params.uid)
     .neq("status", "closed")
     .select("id")
     .maybeSingle();
@@ -397,12 +510,76 @@ export async function canUserAccessTicket(
   ticketId: string
 ): Promise<boolean> {
   const supabase = getSupabaseAdminDb();
-  const { data, error } = await supabase
+  const { data: t, error: tErr } = await supabase
     .from("tickets")
-    .select("id")
+    .select("id,creator_uid,is_global")
     .eq("id", ticketId)
-    .eq("creator_uid", uid)
     .maybeSingle();
-  if (error) return false;
-  return !!data;
+  if (tErr || !t) return false;
+  if (Boolean((t as any).is_global)) return true;
+  if (Number((t as any).creator_uid) === uid) return true;
+
+  const { data: p, error: pErr } = await supabase
+    .from("ticket_participants")
+    .select("ticket_id")
+    .eq("ticket_id", ticketId)
+    .eq("uid", uid)
+    .maybeSingle();
+  if (pErr) return false;
+  return !!p;
+}
+
+export type TicketParticipantUser = {
+  uid: number;
+  username: string;
+  display_name: string | null;
+  is_admin: boolean;
+};
+
+export async function listParticipantsForTicket(
+  ticketId: string
+): Promise<TicketParticipantUser[]> {
+  const supabase = getSupabaseAdminDb();
+  const { data: rows, error } = await supabase
+    .from("ticket_participants")
+    .select("uid,created_at")
+    .eq("ticket_id", ticketId)
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`读取工单参与者失败：${error.message}`);
+
+  const uids = Array.from(
+    new Set((rows ?? []).map((r) => Number((r as any).uid)).filter((v) => Number.isFinite(v)))
+  );
+  if (uids.length === 0) return [];
+
+  const users: any[] = [];
+  for (const ids of chunkArray(uids, POSTGREST_IN_CHUNK_SIZE)) {
+    const res = await supabase
+      .from("users")
+      .select("uid,username,display_name,is_admin")
+      .in("uid", ids);
+    if (res.error) throw new Error(`读取工单参与者失败：${res.error.message}`);
+    users.push(...(res.data ?? []));
+  }
+
+  const byUid = new Map<number, TicketParticipantUser>();
+  for (const u of users) {
+    const uid = Number((u as any).uid);
+    if (!Number.isFinite(uid)) continue;
+    byUid.set(uid, {
+      uid,
+      username: String((u as any).username ?? ""),
+      display_name: (u as any).display_name ?? null,
+      is_admin: Boolean((u as any).is_admin),
+    });
+  }
+
+  // Preserve insertion order by ticket_participants.created_at.
+  const ordered: TicketParticipantUser[] = [];
+  for (const row of rows ?? []) {
+    const uid = Number((row as any).uid);
+    const u = byUid.get(uid);
+    if (u) ordered.push(u);
+  }
+  return ordered;
 }
