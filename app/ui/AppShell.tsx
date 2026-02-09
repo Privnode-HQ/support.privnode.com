@@ -7,7 +7,7 @@ import {
   NavbarContent,
   NavbarItem,
 } from "@heroui/react";
-import { Form, useLocation } from "react-router";
+import { Form, useLocation, useNavigation } from "react-router";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 
 function TopNavLink({ href, label }: { href: string; label: string }) {
@@ -36,9 +36,13 @@ export function AppShell({
   user: { uid: number; username: string; isAdmin: boolean } | null;
 }>) {
   const location = useLocation();
+  const navigation = useNavigation();
   const denseWorkspace =
     location.pathname === "/admin/tickets" ||
     location.pathname.startsWith("/admin/tickets/");
+  const isLoggingOut =
+    navigation.state !== "idle" &&
+    navigation.formData?.get("_intent") === "logout";
 
   return (
     <div className="min-h-dvh flex flex-col">
@@ -66,7 +70,14 @@ export function AppShell({
               </NavbarItem>
               <NavbarItem>
                 <Form method="post" action="/logout">
-                  <Button color="default" variant="flat" type="submit">
+                  <input type="hidden" name="_intent" value="logout" />
+                  <Button
+                    color="default"
+                    variant="flat"
+                    type="submit"
+                    isLoading={isLoggingOut}
+                    isDisabled={isLoggingOut}
+                  >
                     退出
                   </Button>
                 </Form>

@@ -14,7 +14,7 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { Form, Link, data, redirect } from "react-router";
+import { Form, Link, data, redirect, useNavigation } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { memo, useMemo } from "react";
@@ -263,6 +263,14 @@ export default function TicketDetail({
 }: Route.ComponentProps) {
   const { me, ticket, messages, attachments, participants, nudge, queue, permissions } =
     loaderData;
+  const navigation = useNavigation();
+  const pendingIntent =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("_intent") ?? "")
+      : "";
+  const isReplying = pendingIntent === "reply";
+  const isNudging = pendingIntent === "nudge";
+  const isClosing = pendingIntent === "close";
   const { isOpen, onOpen, onClose } = useDisclosure();
 
   // Reverse messages to show newest first
@@ -304,6 +312,7 @@ export default function TicketDetail({
             placeholder="请输入回复内容"
             minRows={6}
             isRequired
+            isDisabled={isReplying}
           />
 
           <div className="space-y-2">
@@ -313,11 +322,17 @@ export default function TicketDetail({
               name="attachments"
               multiple
               className="block w-full text-sm"
+              disabled={isReplying}
             />
             <div className="text-xs text-default-500">单文件不超过 2MB。</div>
           </div>
 
-          <Button color="primary" type="submit">
+          <Button
+            color="primary"
+            type="submit"
+            isLoading={isReplying}
+            isDisabled={isReplying}
+          >
             发送回复
           </Button>
         </Form>
@@ -360,7 +375,8 @@ export default function TicketDetail({
                   type="submit"
                   color="warning"
                   variant="flat"
-                  isDisabled={!nudge.can_nudge}
+                  isLoading={isNudging}
+                  isDisabled={!nudge.can_nudge || isNudging}
                 >
                   催单
                 </Button>
@@ -467,13 +483,19 @@ export default function TicketDetail({
                 name="reason"
                 label="关闭原因（可选）"
                 placeholder="例如：已完成 / 其它（可自填写）"
+                isDisabled={isClosing}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={onClose}>
+              <Button variant="light" onPress={onClose} isDisabled={isClosing}>
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isClosing}
+                isDisabled={isClosing}
+              >
                 确认关闭
               </Button>
             </ModalFooter>

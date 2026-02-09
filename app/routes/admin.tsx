@@ -1,6 +1,6 @@
 import type { Route } from "./+types/admin";
 import { Button, Card, CardBody, CardHeader, Input } from "@heroui/react";
-import { Form, Link, data, redirect } from "react-router";
+import { Form, Link, data, redirect, useNavigation } from "react-router";
 import { requireAdmin } from "../server/admin";
 import { getSupabaseAdminDb } from "../server/supabase.server";
 import { updateMyDisplayName } from "../server/models/admin.server";
@@ -49,6 +49,10 @@ export async function action({ request }: Route.ActionArgs) {
 
 export default function AdminDashboard({ loaderData, actionData }: Route.ComponentProps) {
   const { me } = loaderData;
+  const navigation = useNavigation();
+  const isSaving =
+    navigation.state !== "idle" &&
+    navigation.formData?.get("_intent") === "updateDisplayName";
 
   return (
     <div className="space-y-6">
@@ -75,8 +79,9 @@ export default function AdminDashboard({ loaderData, actionData }: Route.Compone
               defaultValue={me.display_name ?? me.username}
               className="max-w-sm"
               isRequired
+              isDisabled={isSaving}
             />
-            <Button color="primary" type="submit">
+            <Button color="primary" type="submit" isLoading={isSaving} isDisabled={isSaving}>
               保存
             </Button>
           </Form>

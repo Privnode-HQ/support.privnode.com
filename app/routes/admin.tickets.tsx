@@ -22,6 +22,7 @@ import {
   data,
   redirect,
   useLocation,
+  useNavigation,
   useParams,
   useRevalidator,
   useSubmit,
@@ -609,7 +610,20 @@ export default function AdminTickets({
   const submit = useSubmit();
   const location = useLocation();
   const params = useParams();
+  const navigation = useNavigation();
   const revalidator = useRevalidator();
+  const pendingIntent =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("_intent") ?? "")
+      : "";
+  const isRecomputingSmartScores = pendingIntent === "recomputeSmartScores";
+  const isBatchReplying = pendingIntent === "batchReply";
+  const isBatchClosing = pendingIntent === "batchClose";
+  const isBatchDeleting = pendingIntent === "batchDelete";
+  const isCreatingTicket = pendingIntent === "createTicket";
+  const isMergingTickets = pendingIntent === "mergeTickets";
+  const isFiltering =
+    navigation.state !== "idle" && navigation.formMethod === "GET";
 
   const selectedTicketId = params.ticketId;
   const detailScrollRef = useRef<HTMLDivElement | null>(null);
@@ -794,6 +808,7 @@ export default function AdminTickets({
                   variant="flat"
                   className="h-8 px-3 text-sm"
                   isLoading={revalidator.state === "loading"}
+                  isDisabled={revalidator.state === "loading"}
                   onPress={() => revalidator.revalidate()}
                 >
                   刷新
@@ -808,6 +823,8 @@ export default function AdminTickets({
                     type="submit"
                     variant="flat"
                     className="h-8 px-3 text-sm"
+                    isLoading={isRecomputingSmartScores}
+                    isDisabled={isRecomputingSmartScores}
                   >
                     立刻计算
                   </Button>
@@ -1011,7 +1028,13 @@ export default function AdminTickets({
                 </select>
               </label>
 
-              <Button type="submit" variant="flat" className="h-8 px-3 text-sm">
+              <Button
+                type="submit"
+                variant="flat"
+                className="h-8 px-3 text-sm"
+                isLoading={isFiltering}
+                isDisabled={isFiltering}
+              >
                 筛选
               </Button>
               <Button
@@ -1086,6 +1109,7 @@ export default function AdminTickets({
                 name="actor"
                 label="回复身份"
                 defaultSelectedKeys={["staff"]}
+                isDisabled={isBatchReplying}
               >
                 <SelectItem key="staff">操作员</SelectItem>
                 <SelectItem key="anonymous">匿名</SelectItem>
@@ -1096,13 +1120,23 @@ export default function AdminTickets({
                 label="回复内容（Markdown）"
                 minRows={6}
                 isRequired
+                isDisabled={isBatchReplying}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={batchReplyModal.onClose}>
+              <Button
+                variant="light"
+                onPress={batchReplyModal.onClose}
+                isDisabled={isBatchReplying}
+              >
                 取消
               </Button>
-              <Button color="primary" type="submit">
+              <Button
+                color="primary"
+                type="submit"
+                isLoading={isBatchReplying}
+                isDisabled={isBatchReplying}
+              >
                 确认发送
               </Button>
             </ModalFooter>
@@ -1126,13 +1160,23 @@ export default function AdminTickets({
                 name="reason"
                 label="关闭原因（可选）"
                 placeholder="例如：已完成 / 其它（可自填写）"
+                isDisabled={isBatchClosing}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={batchCloseModal.onClose}>
+              <Button
+                variant="light"
+                onPress={batchCloseModal.onClose}
+                isDisabled={isBatchClosing}
+              >
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isBatchClosing}
+                isDisabled={isBatchClosing}
+              >
                 确认关闭
               </Button>
             </ModalFooter>
@@ -1157,10 +1201,19 @@ export default function AdminTickets({
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={batchDeleteModal.onClose}>
+              <Button
+                variant="light"
+                onPress={batchDeleteModal.onClose}
+                isDisabled={isBatchDeleting}
+              >
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isBatchDeleting}
+                isDisabled={isBatchDeleting}
+              >
                 确认删除
               </Button>
             </ModalFooter>
@@ -1189,23 +1242,26 @@ export default function AdminTickets({
                 label="工单类别"
                 isRequired
                 placeholder="选择类别"
+                isDisabled={isCreatingTicket}
               >
                 {loaderData.categories.map((c) => (
                   <SelectItem key={c.id}>{c.name}</SelectItem>
                 ))}
               </Select>
 
-              <Input name="subject" label="标题" isRequired />
+              <Input name="subject" label="标题" isRequired isDisabled={isCreatingTicket} />
 
               <Textarea
                 name="bodyMarkdown"
                 label="工单内容（Markdown）"
                 minRows={6}
                 isRequired
+                isDisabled={isCreatingTicket}
               />
 
               <Checkbox
                 isSelected={createIsGlobal}
+                isDisabled={isCreatingTicket}
                 onValueChange={(checked) => {
                   setCreateIsGlobal(checked);
                   if (checked) setCreateParticipantKeys(new Set());
@@ -1219,7 +1275,7 @@ export default function AdminTickets({
                 label="涉及用户"
                 selectionMode="multiple"
                 placeholder={createIsGlobal ? "已选择所有用户" : "选择一个或多个用户"}
-                isDisabled={createIsGlobal}
+                isDisabled={createIsGlobal || isCreatingTicket}
                 selectedKeys={createParticipantKeys}
                 onSelectionChange={(keys: any) => {
                   if (keys === "all") return;
@@ -1244,18 +1300,27 @@ export default function AdminTickets({
                   name="attachments"
                   multiple
                   className="block w-full text-sm"
+                  disabled={isCreatingTicket}
                 />
                 <div className="text-xs text-default-500">单文件不超过 2MB。</div>
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={createTicketModal.onClose}>
+              <Button
+                variant="light"
+                onPress={createTicketModal.onClose}
+                isDisabled={isCreatingTicket}
+              >
                 取消
               </Button>
               <Button
                 color="primary"
                 type="submit"
-                isDisabled={!createIsGlobal && createParticipantKeys.size === 0}
+                isLoading={isCreatingTicket}
+                isDisabled={
+                  isCreatingTicket ||
+                  (!createIsGlobal && createParticipantKeys.size === 0)
+                }
               >
                 创建
               </Button>
@@ -1299,6 +1364,7 @@ export default function AdminTickets({
               <Checkbox
                 isSelected={mergeMoveMessages}
                 onValueChange={setMergeMoveMessages}
+                isDisabled={isMergingTickets}
               >
                 合并消息与附件（迁移到目标工单）
               </Checkbox>
@@ -1307,16 +1373,26 @@ export default function AdminTickets({
                 label="合并原因（可选）"
                 placeholder="例如：重复工单 / 同一问题集中处理"
                 minRows={3}
+                isDisabled={isMergingTickets}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={mergeTicketsModal.onClose}>
+              <Button
+                variant="light"
+                onPress={mergeTicketsModal.onClose}
+                isDisabled={isMergingTickets}
+              >
                 取消
               </Button>
               <Button
                 color="secondary"
                 type="submit"
-                isDisabled={!targetTicket || mergeableSourceTicketIds.length === 0}
+                isLoading={isMergingTickets}
+                isDisabled={
+                  isMergingTickets ||
+                  !targetTicket ||
+                  mergeableSourceTicketIds.length === 0
+                }
               >
                 确认合并
               </Button>

@@ -7,7 +7,8 @@ import {
   Input,
   Textarea,
 } from "@heroui/react";
-import { Form, Link, data, redirect } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { Form, Link, data, redirect, useNavigation } from "react-router";
 
 type TicketCategory = {
   id: string;
@@ -110,6 +111,7 @@ export async function action({ request }: Route.ActionArgs) {
   const formData: Record<string, string> = {};
   for (const [k, v] of form.entries()) {
     if (k === "categoryId" || k === "subject" || k === "bodyMarkdown") continue;
+    if (k === "_intent") continue;
     if (typeof v !== "string") continue;
     formData[k] = v;
   }
@@ -148,6 +150,19 @@ export async function action({ request }: Route.ActionArgs) {
 export default function NewTicket({ loaderData, actionData }: Route.ComponentProps) {
   const { categories, selectedCategory, selectedFields } = loaderData;
   const createdTicketId = (actionData as any)?.createdTicketId as string | null | undefined;
+  const navigation = useNavigation();
+  const submitLockRef = useRef(false);
+  const [submitLocked, setSubmitLocked] = useState(false);
+  const isSubmitting =
+    submitLocked ||
+    (navigation.state !== "idle" &&
+      navigation.formData?.get("_intent") === "createTicket");
+
+  useEffect(() => {
+    if (navigation.state !== "idle") return;
+    submitLockRef.current = false;
+    setSubmitLocked(false);
+  }, [navigation.state]);
 
   return (
     <div className="space-y-6">
@@ -224,7 +239,16 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
               method="post"
               className="space-y-4"
               encType="multipart/form-data"
+              onSubmit={(e) => {
+                if (submitLockRef.current) {
+                  e.preventDefault();
+                  return;
+                }
+                submitLockRef.current = true;
+                setSubmitLocked(true);
+              }}
             >
+              <input type="hidden" name="_intent" value="createTicket" />
               <input type="hidden" name="categoryId" value={selectedCategory.id} />
 
               <Input
@@ -232,6 +256,7 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
                 label="标题"
                 placeholder="请简要概述问题"
                 isRequired
+                isDisabled={isSubmitting}
               />
 
               {selectedFields.length > 0 ? (
@@ -246,6 +271,7 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
                           label={f.label}
                           placeholder={f.placeholder}
                           isRequired={Boolean(f.required)}
+                          isDisabled={isSubmitting}
                         />
                       ) : (
                         <Input
@@ -254,6 +280,7 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
                           label={f.label}
                           placeholder={f.placeholder}
                           isRequired={Boolean(f.required)}
+                          isDisabled={isSubmitting}
                         />
                       )
                     )}
@@ -267,6 +294,7 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
                 placeholder="请详细描述问题。支持 Markdown，例如：\n\n- 复现步骤\n- 期望结果\n- 实际结果"
                 minRows={8}
                 isRequired
+                isDisabled={isSubmitting}
               />
 
               <div className="space-y-2">
@@ -276,11 +304,12 @@ export default function NewTicket({ loaderData, actionData }: Route.ComponentPro
                   name="attachments"
                   multiple
                   className="block w-full text-sm"
+                  disabled={isSubmitting}
                 />
                 <div className="text-xs text-default-500">单文件不超过 2MB。</div>
               </div>
 
-              <Button color="primary" type="submit">
+              <Button color="primary" type="submit" isLoading={isSubmitting} isDisabled={isSubmitting}>
                 发起工单
               </Button>
             </Form>

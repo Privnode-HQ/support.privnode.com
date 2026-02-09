@@ -8,7 +8,7 @@ import {
   Input,
   Textarea,
 } from "@heroui/react";
-import { Form, data, redirect } from "react-router";
+import { Form, data, redirect, useNavigation } from "react-router";
 import { requireAdmin } from "../server/admin";
 import {
   createCategory,
@@ -93,6 +93,13 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function AdminCategories({ loaderData, actionData }: Route.ComponentProps) {
+  const navigation = useNavigation();
+  const pendingIntent =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("_intent") ?? "")
+      : "";
+  const isCreating = pendingIntent === "create";
+
   return (
     <div className="space-y-6">
       <div className="space-y-1">
@@ -110,16 +117,17 @@ export default function AdminCategories({ loaderData, actionData }: Route.Compon
           <Form method="post" className="space-y-4">
             <input type="hidden" name="_intent" value="create" />
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <Input name="name" label="名称" isRequired />
+              <Input name="name" label="名称" isRequired isDisabled={isCreating} />
               <Input
                 name="sortOrder"
                 label="排序"
                 defaultValue="0"
                 inputMode="numeric"
+                isDisabled={isCreating}
               />
             </div>
-            <Input name="description" label="描述（可选）" />
-            <Checkbox name="enabled" defaultSelected>
+            <Input name="description" label="描述（可选）" isDisabled={isCreating} />
+            <Checkbox name="enabled" defaultSelected isDisabled={isCreating}>
               启用
             </Checkbox>
             <Textarea
@@ -128,8 +136,9 @@ export default function AdminCategories({ loaderData, actionData }: Route.Compon
               defaultValue="[]"
               minRows={6}
               description='示例：[{"key":"order_id","label":"订单号","type":"text","required":false}]'
+              isDisabled={isCreating}
             />
-            <Button color="primary" type="submit">
+            <Button color="primary" type="submit" isLoading={isCreating} isDisabled={isCreating}>
               创建
             </Button>
           </Form>
@@ -141,24 +150,37 @@ export default function AdminCategories({ loaderData, actionData }: Route.Compon
           <Card key={c.id}>
             <CardHeader className="font-medium">编辑：{c.name}</CardHeader>
             <CardBody>
+              {(() => {
+                const isUpdating =
+                  pendingIntent === "update" &&
+                  String(navigation.formData?.get("id") ?? "") === c.id;
+                return (
               <Form method="post" className="space-y-4">
                 <input type="hidden" name="_intent" value="update" />
                 <input type="hidden" name="id" value={c.id} />
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <Input name="name" label="名称" defaultValue={c.name} isRequired />
+                  <Input
+                    name="name"
+                    label="名称"
+                    defaultValue={c.name}
+                    isRequired
+                    isDisabled={isUpdating}
+                  />
                   <Input
                     name="sortOrder"
                     label="排序"
                     defaultValue={String(c.sort_order)}
                     inputMode="numeric"
+                    isDisabled={isUpdating}
                   />
                 </div>
                 <Input
                   name="description"
                   label="描述（可选）"
                   defaultValue={c.description ?? ""}
+                  isDisabled={isUpdating}
                 />
-                <Checkbox name="enabled" defaultSelected={c.enabled}>
+                <Checkbox name="enabled" defaultSelected={c.enabled} isDisabled={isUpdating}>
                   启用
                 </Checkbox>
                 <Textarea
@@ -166,11 +188,14 @@ export default function AdminCategories({ loaderData, actionData }: Route.Compon
                   label="form_schema（JSON）"
                   defaultValue={JSON.stringify(c.form_schema ?? [], null, 2)}
                   minRows={8}
+                  isDisabled={isUpdating}
                 />
-                <Button color="primary" type="submit">
+                <Button color="primary" type="submit" isLoading={isUpdating} isDisabled={isUpdating}>
                   保存
                 </Button>
               </Form>
+                );
+              })()}
             </CardBody>
           </Card>
         ))}
@@ -178,4 +203,3 @@ export default function AdminCategories({ loaderData, actionData }: Route.Compon
     </div>
   );
 }
-

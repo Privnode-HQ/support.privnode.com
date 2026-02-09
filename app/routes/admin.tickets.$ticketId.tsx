@@ -17,7 +17,14 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { Form, Link, data, redirect, useOutletContext } from "react-router";
+import {
+  Form,
+  Link,
+  data,
+  redirect,
+  useNavigation,
+  useOutletContext,
+} from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { memo, useMemo } from "react";
@@ -327,9 +334,18 @@ const MessageCard = memo(function MessageCard(props: {
   message: TicketMessage;
   deletedByLabel: string | null;
   attachments: TicketAttachment[];
+  pendingIntent: string;
+  pendingMessageId: string;
 }) {
   const m = props.message;
   const isMsgDeleted = Boolean(m.deleted_at);
+  const isRestoring =
+    props.pendingIntent === "restoreMessage" && props.pendingMessageId === m.id;
+  const isPurging =
+    props.pendingIntent === "purgeMessage" && props.pendingMessageId === m.id;
+  const isDeleting =
+    props.pendingIntent === "deleteMessage" && props.pendingMessageId === m.id;
+  const isMutating = isRestoring || isPurging || isDeleting;
 
   return (
     <Card
@@ -362,7 +378,14 @@ const MessageCard = memo(function MessageCard(props: {
                 <Form method="post">
                   <input type="hidden" name="_intent" value="restoreMessage" />
                   <input type="hidden" name="messageId" value={m.id} />
-                  <Button size="sm" variant="flat" color="primary" type="submit">
+                  <Button
+                    size="sm"
+                    variant="flat"
+                    color="primary"
+                    type="submit"
+                    isLoading={isRestoring}
+                    isDisabled={isMutating}
+                  >
                     恢复
                   </Button>
                 </Form>
@@ -380,7 +403,14 @@ const MessageCard = memo(function MessageCard(props: {
                 >
                   <input type="hidden" name="_intent" value="purgeMessage" />
                   <input type="hidden" name="messageId" value={m.id} />
-                  <Button size="sm" variant="flat" color="danger" type="submit">
+                  <Button
+                    size="sm"
+                    variant="flat"
+                    color="danger"
+                    type="submit"
+                    isLoading={isPurging}
+                    isDisabled={isMutating}
+                  >
                     彻底删除
                   </Button>
                 </Form>
@@ -396,7 +426,14 @@ const MessageCard = memo(function MessageCard(props: {
               >
                 <input type="hidden" name="_intent" value="deleteMessage" />
                 <input type="hidden" name="messageId" value={m.id} />
-                <Button size="sm" variant="light" color="danger" type="submit">
+                <Button
+                  size="sm"
+                  variant="light"
+                  color="danger"
+                  type="submit"
+                  isLoading={isDeleting}
+                  isDisabled={isMutating}
+                >
                   删除
                 </Button>
               </Form>
@@ -448,6 +485,21 @@ export default function AdminTicketDetail({
 }: Route.ComponentProps) {
   const { categories, users } = useOutletContext<AdminTicketsOutletContext>();
   const { ticket, messages, attachments, participants } = loaderData;
+  const navigation = useNavigation();
+  const pendingIntent =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("_intent") ?? "")
+      : "";
+  const pendingMessageId =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("messageId") ?? "")
+      : "";
+  const isReplying = pendingIntent === "reply";
+  const isAssigningToMe = pendingIntent === "assignToMe";
+  const isClosing = pendingIntent === "close";
+  const isDeletingTicket = pendingIntent === "deleteTicket";
+  const isRestoringTicket = pendingIntent === "restoreTicket";
+  const isPurgingTicket = pendingIntent === "purgeTicket";
   const categoryMap = useMemo(
     () => new Map(categories.map((c) => [c.id, c.name])),
     [categories],
@@ -514,7 +566,12 @@ export default function AdminTicketDetail({
         <Form method="post" className="space-y-2" encType="multipart/form-data">
           <input type="hidden" name="_intent" value="reply" />
 
-          <Select name="actor" label="回复身份" defaultSelectedKeys={["staff"]}>
+          <Select
+            name="actor"
+            label="回复身份"
+            defaultSelectedKeys={["staff"]}
+            isDisabled={isReplying}
+          >
             <SelectItem key="staff">操作员</SelectItem>
             <SelectItem key="anonymous">匿名</SelectItem>
             <SelectItem key="system">系统</SelectItem>
@@ -525,6 +582,7 @@ export default function AdminTicketDetail({
             label="回复内容（Markdown）"
             minRows={4}
             isRequired
+            isDisabled={isReplying}
           />
 
           <div className="space-y-1">
@@ -534,10 +592,17 @@ export default function AdminTicketDetail({
               name="attachments"
               multiple
               className="block w-full text-sm"
+              disabled={isReplying}
             />
             <div className="text-xs text-default-500">单文件不超过 2MB。</div>
           </div>
-          <Button color="primary" type="submit" className="h-9">
+          <Button
+            color="primary"
+            type="submit"
+            className="h-9"
+            isLoading={isReplying}
+            isDisabled={isReplying}
+          >
             发送回复
           </Button>
         </Form>
@@ -624,6 +689,8 @@ export default function AdminTicketDetail({
                   variant="flat"
                   type="submit"
                   className="h-8 px-3 text-sm"
+                  isLoading={isRestoringTicket}
+                  isDisabled={isRestoringTicket}
                 >
                   恢复
                 </Button>
@@ -649,6 +716,8 @@ export default function AdminTicketDetail({
                   variant="flat"
                   type="submit"
                   className="h-8 px-3 text-sm"
+                  isLoading={isAssigningToMe}
+                  isDisabled={isAssigningToMe}
                 >
                   分配给我
                 </Button>
@@ -738,6 +807,8 @@ export default function AdminTicketDetail({
                   message={m}
                   deletedByLabel={deletedByLabel}
                   attachments={msgAttachments}
+                  pendingIntent={pendingIntent}
+                  pendingMessageId={pendingMessageId}
                 />
               );
             })}
@@ -758,13 +829,19 @@ export default function AdminTicketDetail({
                 name="reason"
                 label="关闭原因（可选）"
                 placeholder="例如：已完成 / 其它（可自填写）"
+                isDisabled={isClosing}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={onClose}>
+              <Button variant="light" onPress={onClose} isDisabled={isClosing}>
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isClosing}
+                isDisabled={isClosing}
+              >
                 确认关闭
               </Button>
             </ModalFooter>
@@ -783,10 +860,19 @@ export default function AdminTicketDetail({
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={deleteModal.onClose}>
+              <Button
+                variant="light"
+                onPress={deleteModal.onClose}
+                isDisabled={isDeletingTicket}
+              >
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isDeletingTicket}
+                isDisabled={isDeletingTicket}
+              >
                 确认删除
               </Button>
             </ModalFooter>
@@ -807,13 +893,23 @@ export default function AdminTicketDetail({
                 name="reason"
                 label="删除原因（可选）"
                 placeholder="例如：误报 / 垃圾内容 / 重复导入"
+                isDisabled={isPurgingTicket}
               />
             </ModalBody>
             <ModalFooter>
-              <Button variant="light" onPress={purgeModal.onClose}>
+              <Button
+                variant="light"
+                onPress={purgeModal.onClose}
+                isDisabled={isPurgingTicket}
+              >
                 取消
               </Button>
-              <Button color="danger" type="submit">
+              <Button
+                color="danger"
+                type="submit"
+                isLoading={isPurgingTicket}
+                isDisabled={isPurgingTicket}
+              >
                 确认彻底删除
               </Button>
             </ModalFooter>

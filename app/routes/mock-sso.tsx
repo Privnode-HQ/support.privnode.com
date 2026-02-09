@@ -1,7 +1,7 @@
 import type { Route } from "./+types/mock-sso";
 import { randomUUID } from "node:crypto";
 import { Button, Card, CardBody, CardHeader, Input } from "@heroui/react";
-import { Form, data, redirect } from "react-router";
+import { Form, data, redirect, useNavigation } from "react-router";
 import { env } from "../server/env";
 import { signMockSsoToken } from "../server/sso";
 
@@ -63,6 +63,11 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function MockSso({ loaderData, actionData }: Route.ComponentProps) {
+  const navigation = useNavigation();
+  const isSubmitting =
+    navigation.state !== "idle" &&
+    navigation.formData?.get("_intent") === "mockSsoLogin";
+
   if (!loaderData.enabled) {
     return (
       <div className="space-y-3">
@@ -84,6 +89,7 @@ export default function MockSso({ loaderData, actionData }: Route.ComponentProps
           )}
 
           <Form method="post" className="space-y-4">
+            <input type="hidden" name="_intent" value="mockSsoLogin" />
             <input type="hidden" name="nonce" value={loaderData.nonce} />
             <input type="hidden" name="metadata" value={loaderData.metadata} />
 
@@ -94,6 +100,7 @@ export default function MockSso({ loaderData, actionData }: Route.ComponentProps
               defaultValue="10001"
               inputMode="numeric"
               isRequired
+              isDisabled={isSubmitting}
             />
             <Input
               name="username"
@@ -101,14 +108,21 @@ export default function MockSso({ loaderData, actionData }: Route.ComponentProps
               placeholder="例如：tethys"
               defaultValue="dev-user"
               isRequired
+              isDisabled={isSubmitting}
             />
             <Input
               name="authtk"
               label="authtk（可选）"
               placeholder="留空则自动生成"
+              isDisabled={isSubmitting}
             />
 
-            <Button color="primary" type="submit">
+            <Button
+              color="primary"
+              type="submit"
+              isLoading={isSubmitting}
+              isDisabled={isSubmitting}
+            >
               模拟登录
             </Button>
           </Form>
@@ -117,4 +131,3 @@ export default function MockSso({ loaderData, actionData }: Route.ComponentProps
     </div>
   );
 }
-
